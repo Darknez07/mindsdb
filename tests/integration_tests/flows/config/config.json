@@ -16,11 +16,11 @@
             "user": "mindsdb"
         }
     },
-    "config_version": "1.2",
+    "config_version": "1.3",
     "debug": true,
     "integrations": {
         "default_clickhouse": {
-            "enabled": true,
+            "publish": true,
             "host": "localhost",
             "password": "",
             "port": 8123,
@@ -28,32 +28,23 @@
             "user": "default"
         },
         "default_mariadb": {
-            "enabled": true,
+            "publish": true,
             "host": "localhost",
             "password": "root",
             "port": 3306,
             "type": "mariadb",
             "user": "root"
         },
-        "default_mysql": {
-            "enabled": true,
-            "host": "localhost",
-            "password": "root",
-            "port": 3307,
-            "type": "mysql",
-            "user": "root"
-        },
-        "default_postgres": {
-            "enabled": true,
-            "host": "localhost",
-            "user": "postgres",
+        "default_mongodb": {
+            "publish": false,
+            "host": "127.0.0.1",
             "password": "",
-            "database": "postgres",
-            "port": 5432,
-            "type": "postgres"
+            "port": 27001,
+            "type": "mongodb",
+            "user": ""
         },
         "default_mssql": {
-            "enabled": true,
+            "publish": true,
             "host": "127.0.0.1",
             "odbc_driver_name": "MySQL ODBC 8.0 Unicode Driver",
             "password": "password",
@@ -61,27 +52,26 @@
             "type": "mssql",
             "user": "sa"
         },
-        "default_mongodb": {
-            "enabled": false,
-            "host": "127.0.0.1",
+        "default_mysql": {
+            "publish": true,
+            "host": "localhost",
+            "password": "root",
+            "port": 3307,
+            "type": "mysql",
+            "user": "root"
+        },
+        "default_postgres": {
+            "database": "postgres",
+            "publish": true,
+            "host": "localhost",
             "password": "",
-            "port": 27001,
-            "type": "mongodb",
-            "user": ""
-        }
-    },
-    "interface": {
-        "dataskillet": {
-            "enabled": false
+            "port": 5432,
+            "type": "postgres",
+            "user": "postgres"
         },
-        "datastore": {
-            "enabled": true
-        },
-        "lightwood": {
-            "enabled": true
-        },
-        "mindsdb_native": {
-            "enabled": true
+        "default_snowflake": {
+            "publish": false,
+            "type": "snowflake"
         }
     },
     "log": {
@@ -90,7 +80,5 @@
             "file": "ERROR"
         }
     },
-    "pip_path": null,
-    "python_interpreter": null,
     "storage_dir": "/tmp/mindsdb_storage"
 }

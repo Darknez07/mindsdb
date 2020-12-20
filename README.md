@@ -17,18 +17,23 @@ MindsDB is an open-source AI layer for existing databases that allows you to eff
 <h2 align="center">
    Predictive AI layer for existing databases
    <br/>
-  <img width="600" src="https://assets.website-files.com/5f500135c5852524c3845958/5f5024f70d3e5f408250a4a9_Mindsdb%20AI%20tables.gif" alt="MindsDB">	
+  <img width="600" src="https://mindsdbuploads.s3-us-west-2.amazonaws.com/ai-tables.gif" alt="MindsDB">	
 </h2>
 
 
 ## Try it out
 
 * [Installing MindsDB](https://docs.mindsdb.com/Installing/)
+	* [Install on Linux](https://docs.mindsdb.com/installation/Linux/)
+	* [Install on Windows](https://docs.mindsdb.com/installation/Windows/)
+	* [Install on MacOS](https://docs.mindsdb.com/installation/MacOS/)
 * [AI Tables](https://docs.mindsdb.com/databases/)
 	* [AI Tables in MariaDB](https://docs.mindsdb.com/databases/MariaDB/)
 	* [AI Tables in ClickHouse](https://docs.mindsdb.com/databases/Clickhouse/)
+	* [AI Tables in MySQL](https://docs.mindsdb.com/databases/MySQL/)
+	* [AI Tables in PostgreSQL](https://docs.mindsdb.com/databases/PostgreSQL/)
 * [Learning from Examples](https://docs.mindsdb.com/tutorials/BasicExample/)
-* [MindsDB Explainability GUI](http://mindsdb.com/product)
+* [MindsDB Explainability GUI](https://docs.mindsdb.com/scout/Introduction/)
 * [Frequently Asked Questions](https://docs.mindsdb.com/FAQ/)
 
 ### Installation
@@ -68,7 +73,7 @@ MindsDB is an open-source AI layer for existing databases that allows you to eff
 * **Docker**: If you would like to run it all in a container simply:  
 
 ```bash
-sh -c "$(curl -sSL https://raw.githubusercontent.com/mindsdb/mindsdb/master/distributions/docker/build-docker.sh)"
+sh -c "$(curl -sSL https://raw.githubusercontent.com/mindsdb/mindsdb/stable/distributions/docker/build-docker.sh)"
 ```
 
 ## MindsDB AI tables demo using MariaDB (Video tutorial)
@@ -83,6 +88,13 @@ Please click on the image below to load the tutorial:
 
 To contribute to mindsdb, please check out our [Contribution guide](https://github.com/mindsdb/mindsdb/blob/stable/CONTRIBUTING.md).
 
+### Current contributors
+
+<a href="https://github.com/mindsdb/mindsdb/graphs/contributors">
+  <img src="https://contributors-img.web.app/image?repo=mindsdb/mindsdb" />
+</a>
+
+Made with [contributors-img](https://contributors-img.web.app).
 
 ## Report Issues
 

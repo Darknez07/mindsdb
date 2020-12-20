@@ -4,6 +4,8 @@ import sys
 import os
 import time
 import asyncio
+import logging
+import datetime
 
 from pkg_resources import get_distribution
 import torch.multiprocessing as mp
@@ -14,25 +16,62 @@ from mindsdb.interfaces.custom.custom_models import CustomModels
 from mindsdb.api.http.start import start as start_http
 from mindsdb.api.mysql.start import start as start_mysql
 from mindsdb.api.mongo.start import start as start_mongo
-from mindsdb.utilities.fs import get_or_create_dir_struct, update_versions_file
+from mindsdb.utilities.fs import (
+    get_or_create_dir_struct,
+    update_versions_file,
+    archive_obsolete_predictors,
+    remove_corrupted_predictors
+)
 from mindsdb.utilities.ps import is_pid_listen_port
 from mindsdb.interfaces.database.database import DatabaseWrapper
-from mindsdb.utilities.functions import args_parse
+from mindsdb.utilities.functions import args_parse, get_all_models_meta_data
+from mindsdb.utilities.log import initialize_log
 
 
 def close_api_gracefully(apis):
-    for api in apis.values():
-        process = api['process']
-        sys.stdout.flush()
-        process.terminate()
-        process.join()
-        sys.stdout.flush()
+    try:
+        for api in apis.values():
+            process = api['process']
+            sys.stdout.flush()
+            process.terminate()
+            process.join()
+            sys.stdout.flush()
+    except KeyboardInterrupt:
+        sys.exit(0)
 
 
 if __name__ == '__main__':
+    version_error_msg = """
+MindsDB server requires Python >= 3.6 to run
+
+Once you have Python 3.6 installed you can tun mindsdb as follows:
+
+1. create and activate venv:
+python3.6 -m venv venv
+source venv/bin/activate
+
+2. install MindsDB:
+pip3 install mindsdb
+
+3. Run MindsDB
+python3.6 -m mindsdb
+
+More instructions in https://docs.mindsdb.com
+    """
+
+    if not (sys.version_info[0] >= 3 and sys.version_info[1] >= 6):
+        print(version_error_msg)
+        exit(1)
+
     mp.freeze_support()
 
     args = args_parse()
+
+    from mindsdb.__about__ import __version__ as mindsdb_version
+
+    if args.version:
+        print(f'MindsDB {mindsdb_version}')
+        sys.exit(0)
 
     config_path = args.config
     if config_path is None:
@@ -41,11 +80,15 @@ if __name__ == '__main__':
 
     config = Config(config_path)
 
-    from mindsdb.__about__ import __version__ as mindsdb_version
+    if args.verbose is True:
+        config['log']['level']['console'] = 'DEBUG'
+    os.environ['DEFAULT_LOG_LEVEL'] = config['log']['level']['console']
+    os.environ['LIGHTWOOD_LOG_LEVEL'] = config['log']['level']['console']
 
-    if args.version:
-        print(f'MindsDB {mindsdb_version}')
-        sys.exit(0)
+    config.set(['mindsdb_last_started_at'], str(datetime.datetime.now()))
+
+    initialize_log(config)
+    log = logging.getLogger('mindsdb.main')
 
     try:
         lightwood_version = get_distribution('lightwood').version
@@ -66,13 +109,6 @@ if __name__ == '__main__':
     print(f' - MindsDB {mindsdb_version}')
 
     os.environ['MINDSDB_STORAGE_PATH'] = config.paths['predictors']
-    if args.verbose is True:
-        config['log']['level']['console'] = 'DEBUG'
-        os.environ['DEFAULT_LOG_LEVEL'] = 'DEBUG'
-        os.environ['LIGHTWOOD_LOG_LEVEL'] = 'DEBUG'
-    else:
-        os.environ['DEFAULT_LOG_LEVEL'] = 'ERROR'
-        os.environ['LIGHTWOOD_LOG_LEVEL'] = 'ERROR'
 
     update_versions_file(
         config,
@@ -109,30 +145,20 @@ if __name__ == '__main__':
         'mongodb': start_mongo
     }
 
+    archive_obsolete_predictors(config, '2.11.0')
+
     mdb = MindsdbNative(config)
     cst = CustomModels(config)
-    # @TODO Maybe just use `get_model_data` directly here ? Seems like a useless abstraction
-    model_data_arr = [
-        {
-            'name': x['name'],
-            'predict': x['predict'],
-            'data_analysis': mdb.get_model_data(x['name'])['data_analysis_v2']
-        } for x in mdb.get_models()
-    ]
 
-    for m in model_data_arr:
-        if 'columns_to_ignore' in m['data_analysis']:
-            del m['data_analysis']['columns_to_ignore']
-        if 'train_std_dev' in m['data_analysis']:
-            del m['data_analysis']['train_std_dev']
+    remove_corrupted_predictors(config, mdb)
 
-    model_data_arr.extend(cst.get_models())
+    model_data_arr = get_all_models_meta_data(mdb, cst)
 
     dbw = DatabaseWrapper(config)
     dbw.register_predictors(model_data_arr)
 
     for broken_name in [name for name, connected in dbw.check_connections().items() if connected is False]:
-        print(f'Error failed to integrate with database aliased: {broken_name}')
+        log.error(f'Error failed to integrate with database aliased: {broken_name}')
 
     ctx = mp.get_context('spawn')
 
@@ -144,14 +170,13 @@ if __name__ == '__main__':
             api_data['process'] = p
         except Exception as e:
             close_api_gracefully(apis)
-            print(f'Failed to start {api_name} API with exception {e}')
-            print(traceback.format_exc())
+            log.error(f'Failed to start {api_name} API with exception {e}\n{traceback.format_exc()}')
             raise
 
     atexit.register(close_api_gracefully, apis=apis)
 
     async def wait_api_start(api_name, pid, port):
-        timeout = 15
+        timeout = 60
         start_time = time.time()
         started = is_pid_listen_port(pid, port)
         while (time.time() - start_time) < timeout and started is False:
@@ -169,7 +194,7 @@ if __name__ == '__main__':
             if started:
                 print(f"{api_name} API: started on {port}")
             else:
-                print(f"ERROR: {api_name} API cant start on {port}")
+                log.error(f"ERROR: {api_name} API cant start on {port}")
 
     ioloop = asyncio.get_event_loop()
     ioloop.run_until_complete(wait_apis_start())

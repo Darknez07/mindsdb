@@ -7,10 +7,11 @@ import webbrowser
 from zipfile import ZipFile
 from pathlib import Path
 import logging
+import traceback
+#import concurrent.futures
 
 from flask import Flask, url_for
 from flask_restx import Api
-from flask_cors import CORS
 
 from mindsdb.__about__ import __version__ as mindsdb_version
 from mindsdb.interfaces.datastore.datastore import DataStore
@@ -30,6 +31,11 @@ class Swagger_Api(Api):
 
 
 def initialize_static(config):
+    ''' Update Scout files basing on compatible-config.json content.
+        Files will be downloaded and updated if new version of GUI > current.
+        Current GUI version stored in static/version.txt.
+    '''
+    log = logging.getLogger('mindsdb.http')
     static_path = Path(config.paths['static'])
     static_path.mkdir(parents=True, exist_ok=True)
 
@@ -56,21 +62,37 @@ def initialize_static(config):
 
     try:
         gui_versions = {}
-        gui_version_lv = None
         max_mindsdb_lv = None
+        max_gui_lv = None
         for el in versions['mindsdb']:
-            mindsdb_lv = LooseVersion(el['mindsdb_version'])
-            gui_lv = LooseVersion(el['gui_version'])
-            if mindsdb_lv.vstring not in gui_versions or gui_lv > gui_versions[mindsdb_lv.vstring]:
-                gui_versions[mindsdb_lv.vstring] = gui_lv
-            if max_mindsdb_lv is None or max_mindsdb_lv < mindsdb_lv:
-                max_mindsdb_lv = mindsdb_lv
+            if el['mindsdb_version'] is None:
+                gui_lv = LooseVersion(el['gui_version'])
+            else:
+                mindsdb_lv = LooseVersion(el['mindsdb_version'])
+                gui_lv = LooseVersion(el['gui_version'])
+                if mindsdb_lv.vstring not in gui_versions or gui_lv > gui_versions[mindsdb_lv.vstring]:
+                    gui_versions[mindsdb_lv.vstring] = gui_lv
+                if max_mindsdb_lv is None or max_mindsdb_lv < mindsdb_lv:
+                    max_mindsdb_lv = mindsdb_lv
+            if max_gui_lv is None or max_gui_lv < gui_lv:
+                max_gui_lv = gui_lv
+
+        all_mindsdb_lv = [LooseVersion(x) for x in gui_versions.keys()]
+        all_mindsdb_lv.sort()
+
         if current_mindsdb_lv.vstring in gui_versions:
             gui_version_lv = gui_versions[current_mindsdb_lv.vstring]
+        elif current_mindsdb_lv > all_mindsdb_lv[-1]:
+            gui_version_lv = max_gui_lv
         else:
-            gui_version_lv = gui_versions[max_mindsdb_lv.vstring]
+            lower_versions = {key: value for key, value in gui_versions.items() if LooseVersion(key) < current_mindsdb_lv}
+            if len(lower_versions) == 0:
+                gui_version_lv = gui_versions[all_mindsdb_lv[0].vstring]
+            else:
+                all_lower_versions = [LooseVersion(x) for x in lower_versions.keys()]
+                gui_version_lv = gui_versions[all_lower_versions[-1].vstring]
     except Exception as e:
-        print(f'Error in compatible-config.json structure: {e}')
+        log.error(f'Error in compatible-config.json structure: {e}')
         return False
 
     current_gui_version = None
@@ -83,7 +105,8 @@ def initialize_static(config):
         current_gui_lv = LooseVersion(current_gui_version)
         if current_gui_lv >= gui_version_lv:
             return True
-    print('New version of GUI available. Downloading...')
+
+    log.info(f'New version of GUI available ({gui_version_lv.vstring}). Downloading...')
 
     shutil.rmtree(static_path)
     static_path.mkdir(parents=True, exist_ok=True)
@@ -94,53 +117,91 @@ def initialize_static(config):
         media_zip_path = str(static_path.joinpath('media.zip'))
         bucket = "https://mindsdb-web-builds.s3.amazonaws.com/"
 
-        cssZip = requests.get(bucket + 'css-V' + gui_version_lv.vstring + '.zip')
-        open(css_zip_path, 'wb').write(cssZip.content)
+        gui_version = gui_version_lv.vstring
 
-        jsZip = requests.get(bucket + 'js-V' + gui_version_lv.vstring + '.zip')
-        open(js_zip_path, 'wb').write(jsZip.content)
+        resources = [
+            {
+                'url': bucket + 'css-V' + gui_version + '.zip',
+                'path': css_zip_path
+            }, {
+                'url': bucket + 'js-V' + gui_version + '.zip',
+                'path': js_zip_path
+            }, {
+                'url': bucket + 'indexV' + gui_version + '.html',
+                'path': str(static_path.joinpath('index.html'))
+            }, {
+                'url': bucket + 'favicon.ico',
+                'path': str(static_path.joinpath('favicon.ico'))
+            }, {
+                'url': bucket + 'media.zip',
+                'path': media_zip_path
+            }
+        ]
 
-        indexFile = requests.get(bucket + 'indexV' + gui_version_lv.vstring + '.html')
-        open(str(static_path.joinpath('index.html')), 'wb').write(indexFile.content)
+        def get_resources(resource):
+            try:
+                response = requests.get(resource['url'])
+                if response.status_code != requests.status_codes.codes.ok:
+                    return Exception(f"Error {response.status_code} GET {resource['url']}")
+                open(resource['path'], 'wb').write(response.content)
+            except Exception as e:
+                return e
+            return None
 
-        # Common resource
-        faviconFile = requests.get(bucket + 'favicon.ico')
-        open(str(static_path.joinpath('favicon.ico')), 'wb').write(faviconFile.content)
+        for r in resources:
+            get_resources(r)
 
-        mediaZip = requests.get(bucket + 'media.zip')
-        open(media_zip_path, 'wb').write(mediaZip.content)
+        '''
+        # to make downloading faster download each resource in a separate thread
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            future_to_url = {executor.submit(get_resources, r): r for r in resources}
+            for future in concurrent.futures.as_completed(future_to_url):
+                res = future.result()
+                if res is not None:
+                    raise res
+        '''
+
     except Exception as e:
-        print(f'Error during downloading files from s3: {e}')
+        log.error(f'Error during downloading files from s3: {e}')
         return False
 
+    static_folder = static_path.joinpath('static')
+    static_folder.mkdir(parents=True, exist_ok=True)
+
     # unzip process
-    ZipFile(js_zip_path).extractall(static_path)
-    ZipFile(css_zip_path).extractall(static_path)
-    ZipFile(media_zip_path).extractall(static_path)
+    for zip_path, dir_name in [[js_zip_path, 'js'], [css_zip_path, 'css']]:
+        temp_dir = static_path.joinpath(f'temp_{dir_name}')
+        temp_dir.mkdir(mode=0o777, exist_ok=True, parents=True)
+        ZipFile(zip_path).extractall(temp_dir)
+        files_path = static_path.joinpath('static', dir_name)
+        if temp_dir.joinpath('build', 'static', dir_name).is_dir():
+            shutil.move(temp_dir.joinpath('build', 'static', dir_name), files_path)
+            shutil.rmtree(temp_dir)
+        else:
+            shutil.move(temp_dir, files_path)
+
+    ZipFile(media_zip_path).extractall(static_folder)
 
     os.remove(js_zip_path)
     os.remove(css_zip_path)
     os.remove(media_zip_path)
 
-    shutil.move(static_path.joinpath('build', 'static', 'js'), static_path.joinpath('js'))
-    shutil.move(static_path.joinpath('build', 'static', 'css'), static_path.joinpath('css'))
-
-    shutil.rmtree(static_path.joinpath('build'))
-
     with open(version_txt_path, 'wt') as f:
         f.write(gui_version_lv.vstring)
 
-    print(f'GUI version updated to {gui_version_lv.vstring}')
+    log.info(f'GUI version updated to {gui_version_lv.vstring}')
     return True
 
 
 def initialize_flask(config):
+    # Apparently there's a bug that causes the static path not to work if it's '/' -- https://github.com/pallets/flask/issues/3134, I think '' should achieve the same thing (???)
     app = Flask(
         __name__,
         static_url_path='/static',
-        static_folder=config.paths['static']
+        static_folder=os.path.join(config.paths['static'], 'static/')
     )
 
+    app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 60
     app.config['SWAGGER_HOST'] = 'http://localhost:8000/mindsdb'
     authorizations = {
         'apikey': {
@@ -155,20 +216,19 @@ def initialize_flask(config):
     hosts = ['0.0.0.0', 'localhost', '127.0.0.1']
     if host not in hosts:
         hosts.append(host)
-    cors_origin_list = [f'http://{h}:{port}' for h in hosts]
 
-    if 'MINDSDB_CORS_PORT' in os.environ:
-        ports = os.environ['MINDSDB_CORS_PORT'].strip('[]').split(',')
-        ports = [f'http://{host}:{p}' for p in ports]
-        cors_origin_list.extend(ports)
-
-    CORS(app, resources={r"/*": {"origins": cors_origin_list}})
-
-    api = Swagger_Api(app, authorizations=authorizations, security=['apikey'], url_prefix=':8000')
+    api = Swagger_Api(
+        app,
+        authorizations=authorizations,
+        security=['apikey'],
+        url_prefix=':8000',
+        prefix='/api',
+        doc='/doc/'
+    )
 
     # NOTE rewrite it, that hotfix to see GUI link
     log = logging.getLogger('mindsdb.http')
-    url = f'http://{host}:{port}/static/index.html'
+    url = f'http://{host}:{port}/'
     log.error(f' - GUI available at {url}')
 
     pid = os.getpid()

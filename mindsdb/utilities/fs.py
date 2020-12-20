@@ -1,9 +1,12 @@
 import inspect
 import os
+import time
 from pathlib import Path
 import json
 import shutil
 import pickle
+from distutils.version import LooseVersion
+import logging
 
 
 def create_directory(path):
@@ -37,8 +40,8 @@ def get_paths():
                 '/var/lib/mindsdb'
             ),
             (
-                '~/.local/etc/mindsdb',
-                '~/.local/var/lib/mindsdb'
+                '{}/.local/etc/mindsdb'.format(Path.home()),
+                '{}/.local/var/lib/mindsdb'.format(Path.home())
             )
         ])
 
@@ -48,23 +51,23 @@ def get_paths():
 def get_or_create_dir_struct():
     for tup in get_paths():
         try:
-            for dir in tup:
-                assert(os.path.exists(dir))
-                assert(os.access(dir, os.W_OK) == True)
+            for _dir in tup:
+                assert os.path.exists(_dir)
+                assert os.access(_dir, os.W_OK) is True
 
             config_dir = tup[0]
             if 'DEV_CONFIG_PATH' in os.environ:
                 config_dir = os.environ['DEV_CONFIG_PATH']
 
             return config_dir, tup[1]
-        except Exception as e:
+        except Exception:
             pass
 
     for tup in get_paths():
         try:
-            for dir in tup:
-                create_directory(dir)
-                assert(os.access(dir, os.W_OK) == True)
+            for _dir in tup:
+                create_directory(_dir)
+                assert os.access(_dir, os.W_OK) is True
 
             config_dir = tup[0]
             if 'DEV_CONFIG_PATH' in os.environ:
@@ -72,10 +75,10 @@ def get_or_create_dir_struct():
 
             return config_dir, tup[1]
 
-        except Exception as e:
+        except Exception:
             pass
 
-    raise Exception(f'MindsDB storage directory: {path} does not exist and could not be created, trying another directory')
+    raise Exception('MindsDB storage directory does not exist and could not be created')
 
 
 def do_init_migration(paths):
@@ -145,3 +148,68 @@ def update_versions_file(config, versions):
 
     with open(versions_file_path, 'wt') as f:
         json.dump(versions, f, indent=4, sort_keys=True)
+
+
+def create_dirs_recursive(path):
+    if isinstance(path, dict):
+        for p in path.values():
+            create_dirs_recursive(p)
+    elif isinstance(path, str):
+        create_directory(path)
+    else:
+        raise ValueError(f'Wrong path: {path}')
+
+
+def archive_obsolete_predictors(config, old_version):
+    ''' move all predictors trained on mindsdb with version less than
+        old_version to folder for obsolete predictors
+
+        Predictors are outdated in:
+        v2.11.0 - in mindsdb_native added ['data_analysis_v2']['columns']
+    '''
+    obsolete_predictors = []
+    obsolete_predictors_dir = config.paths['obsolete']['predictors']
+    for f in Path(config.paths['predictors']).iterdir():
+        if f.is_dir():
+            if not f.joinpath('versions.json').is_file():
+                obsolete_predictors.append(f.name)
+            else:
+                with open(f.joinpath('versions.json'), 'rt') as vf:
+                    versions = json.loads(vf.read())
+                if LooseVersion(versions['mindsdb']) < LooseVersion(old_version):
+                    obsolete_predictors.append(f.name)
+    if len(obsolete_predictors) > 0:
+        print('These predictors are outdated and moved to {storage_dir}/obsolete/ folder:')
+        for p in obsolete_predictors:
+            print(f' - {p}')
+            new_path = Path(obsolete_predictors_dir).joinpath(p)
+            if Path(obsolete_predictors_dir).joinpath(p).is_dir():
+                i = 1
+                while Path(obsolete_predictors_dir).joinpath(f'{p}_{i}').is_dir():
+                    i += 1
+                new_path = Path(obsolete_predictors_dir).joinpath(f'{p}_{i}')
+
+            shutil.move(
+                Path(config.paths['predictors']).joinpath(p),
+                new_path
+            )
+
+
+def remove_corrupted_predictors(config, mindsdb_native):
+    ''' Checking that all predictors can be loaded.
+        If not - then move such predictir to {storage_dir}/tmp/corrupted_predictors
+    '''
+    for p in [x for x in Path(config.paths['predictors']).iterdir() if x.is_dir()]:
+        model_name = p.name
+        try:
+            mindsdb_native.get_model_data(model_name)
+        except Exception as e:
+            log = logging.getLogger('mindsdb.main')
+            log.error(f"Error: predictor '{model_name}' corrupted. Move predictor data to '{{storage_dir}}/tmp/corrupted_predictors' dir.")
+            log.error(f"Reason is: {e}")
+            corrupted_predictors_dir = Path(config.paths['tmp']).joinpath('corrupted_predictors')
+            create_directory(corrupted_predictors_dir)
+            shutil.move(
+                str(p),
+                str(corrupted_predictors_dir.joinpath( model_name + str(int(time.time())) ))
+            )

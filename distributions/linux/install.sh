@@ -49,12 +49,25 @@ fi
 
 printf "Detected python: $python_path\ndetected pip: $pip_path"
 
-# Check that it's indeed python 3.6 and that pip works
+# Check that it's indeed python > 3.6 and that pip works
 ${python_path} -c "import sys; print('Sorry, MindsDB requires Python 3.6+') and exit(1) if sys.version_info < (3,6) else exit(0)"
 ${pip_path} --version > /dev/null 2>&1
 
 export MDB_INSTALL_PYTHONPATH="$python_path"
 export MDB_INSTALL_PIPPATH="$pip_path"
+export MDB_SOURCE_VENV=""
+
+if [ "$1" != "native" ]; then
+  printf "Creating virtual environment in which to install and run mindsdb. If you'd prefer to install in your local environment, please call this script again and provide `native` as its first argumnet."
+
+  "${MDB_INSTALL_PIPPATH}" install --user --upgrade pip
+  "${MDB_INSTALL_PIPPATH}" install --user virtualenv
+  "${MDB_INSTALL_PYTHONPATH}" -m virtualenv mindsdb_env --python="${MDB_INSTALL_PYTHONPATH}"
+  export MDB_SOURCE_VENV="source mindsdb_env/bin/activate"
+
+fi;
+
+eval $MDB_SOURCE_VENV
 
 cmdcol="$(tput sgr0)$(tput bold)"
 normalcol="$(tput sgr0)"
@@ -91,65 +104,62 @@ $cmdcol
 """
 
 temp_file=$(mktemp)
-trap "rm -f $temp_file" 0 2 3 15 #Making sure the file is deleted after script finishes
+trap "rm -f $temp_file" 0 2 3 15 # Making sure the file is deleted after script finishes
 
 # Python code below
 cat << EOF > $temp_file
 #!$python_path
 
-import traceback
-import sys
 import os
-from pathlib import Path
+import sys
 import time
-from os.path import expanduser
-
 
 python_path = sys.argv[1]
-pip_path    = sys.argv[2]
-home = expanduser("~")
-mdb_home = os.path.join(home, 'mindsdb')
-
+pip_path = sys.argv[2]
 
 print(f'\nInstalling some large dependencies via pip ({pip_path}), this might take a while\n')
 time.sleep(1)
 
-retcode = os.system(f'{pip_path} install  git+https://github.com/mindsdb/mindsdb_server.git@split --upgrade')
+retcode = os.system(f'{pip_path} install --upgrade pip==20.2.4')
 if retcode != 0:
-    raise(Exception("Command exited with error"))
+    raise Exception("Command exited with error")
 
-dataskillet_source = None
-lightwood_source = f'git+https://github.com/mindsdb/lightwood.git@stable'
-mindsdb_native_source = f'git+https://github.com/mindsdb/mindsdb_native.git@stable'
+retcode = os.system(f'{pip_path} install mindsdb==$version')
+if retcode != 0:
+    raise Exception("Command exited with error")
 
-for source in [dataskillet_source,lightwood_source,mindsdb_native_source]:
-    if isinstance(source,str):
-        retcode = os.system(f'{pip_path} install {source} --upgrade')
-        if retcode != 0:
-            raise(Exception("Command exited with error"))
 time.sleep(1)
 print('Done installing dependencies')
 print('\nLast step: Configure Mindsdb\n')
 
-from mindsdb_server.utilities.wizards import daemon_creator, make_executable
+# home = os.path.expanduser("~")
+exec_path = os.path.join(os.getcwd(), 'mindsdb')
 
-daemon_path = daemon_creator(python_path)
-print(f"Created daemon service config {daemon_path}")
+text = '\n'.join([
+  '#!/bin/bash',
+  '$MDB_SOURCE_VENV',
+  f'{python_path} -m mindsdb --api=http,mysql,mongodb',
+])
 
-exec_path = str(os.path.join(mdb_home,'run'))
-make_executable(python_path, exec_path)
+with open(exec_path, 'w') as fp:
+    fp.write(text)
+
+try:
+  os.system(f'chmod +x {exec_path}')
+except:
+  pass
+
 print(f"Created executable at {exec_path}")
 
 print('Installation complete!')
 
-print(f'You can use Mindsdb by running {exec_path}. Or by importing it as the mindsdb_native library from within python.')
-
+print(f'You can use Mindsdb by running {exec_path}. Or by importing it as a python package, if you installed with `native` as the first argument.')
 
 EOF
 #/Python code
 
-chmod 755 $temp_file
+chmod 755 $temp_file;
 
-INSTALLER_SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+INSTALLER_SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)" &&
 
-"${MDB_INSTALL_PYTHONPATH}" "$temp_file" "$MDB_INSTALL_PYTHONPATH" "$MDB_INSTALL_PIPPATH"
+"${MDB_INSTALL_PYTHONPATH}" "$temp_file" "$MDB_INSTALL_PYTHONPATH" "$MDB_INSTALL_PIPPATH";

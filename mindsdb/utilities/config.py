@@ -10,12 +10,34 @@ default_config = {
             "console": "ERROR",
             "file": "WARNING"
         }
+
+    },
+    "debug": False,
+    "integrations": {},
+    "api": {
+        "http": {
+            "host": "127.0.0.1",
+            "port": "47334"
+        },
+        "mysql": {
+            "host": "127.0.0.1",
+            "password": "",
+            "port": "47335",
+            "user": "mindsdb",
+            "database": "mindsdb",
+            "ssl": True
+        },
+        "mongodb": {
+            "host": "127.0.0.1",
+            "port": "47336",
+            "database": "mindsdb"
+        }
     }
 }
 
 
 class Config(object):
-    current_version = '1.3'
+    current_version = '1.4'
     _config = {}
     paths = {
         'root': '',
@@ -23,7 +45,11 @@ class Config(object):
         'predictors': '',
         'static': '',
         'tmp': '',
-        'log': ''
+        'log': '',
+        'obsolete': {
+            'predictors': '',
+            'datasources': ''
+        }
     }
     versions = {}
 
@@ -32,7 +58,7 @@ class Config(object):
         self._config_hash = None
         self._config = None
         if isinstance(config_path, str):
-            self.config_path = config_path
+            self.config_path = os.path.abspath(config_path)
             self._read()
             self._config_hash = self._gen_hash()
 
@@ -40,7 +66,7 @@ class Config(object):
             if os.path.isabs(storage_dir) is False:
                 storage_dir = os.path.normpath(
                     os.path.join(
-                        os.path.dirname(config_path),
+                        os.path.dirname(self.config_path),
                         storage_dir
                     )
                 )
@@ -50,6 +76,8 @@ class Config(object):
             self.paths['static'] = os.path.join(storage_dir, 'static')
             self.paths['tmp'] = os.path.join(storage_dir, 'tmp')
             self.paths['log'] = os.path.join(storage_dir, 'log')
+            self.paths['obsolete']['predictors'] = os.path.join(storage_dir, 'obsolete', 'predictors')
+            self.paths['obsolete']['datasources'] = os.path.join(storage_dir, 'obsolete', 'datasources')
 
             self._read_versions_file(os.path.join(self.paths['root'], 'versions.json'))
         else:
@@ -144,10 +172,23 @@ class Config(object):
             config['config_version'] = '1.3'
             return config
 
+        def m1_3(config):
+            ''' rename integration['enabled'] to integration['publish']
+            '''
+            for integration in config.get('integrations', []).values():
+                if 'enabled' in integration:
+                    enabled = integration['enabled']
+                    del integration['enabled']
+                    integration['publish'] = enabled
+
+            config['config_version'] = '1.4'
+            return config
+
         migrations = {
             '1.0': m1_0,
             '1.1': m1_1,
-            '1.2': m1_2
+            '1.2': m1_2,
+            '1.3': m1_3
         }
 
         current_version = self._parse_version(self._config['config_version'])
@@ -242,9 +283,7 @@ class Config(object):
         return self._config
 
     def set(self, key_chain, value, delete=False):
-        with open(self.config_path, 'r') as fp:
-            self._config = json.load(fp)
-
+        self._read()
         c = self._config
         for i, k in enumerate(key_chain):
             if k in c and i + 1 < len(key_chain):
@@ -264,8 +303,8 @@ class Config(object):
         dict['date_last_update'] = str(datetime.datetime.now()).split('.')[0]
         if 'database_name' not in dict:
             dict['database_name'] = name
-        if 'enabled' not in dict:
-            dict['enabled'] = True
+        if 'publish' not in dict:
+            dict['publish'] = True
 
         self.set(['integrations', name], dict)
 

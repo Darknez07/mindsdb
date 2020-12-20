@@ -1,10 +1,9 @@
-from subprocess import Popen
-import time
 import os
 from random import randint
 from pathlib import Path
 import unittest
 import requests
+import time
 
 import psutil
 
@@ -19,33 +18,29 @@ spec.loader.exec_module(common)
 rand = randint(0, pow(10, 12))
 ds_name = f'hr_ds_{rand}'
 pred_name = f'hr_predictor_{rand}'
-root = 'http://localhost:47334'
+root = 'http://localhost:47334/api'
 
 
 class HTTPTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        config = Config(common.TEST_CONFIG)
-        cls.initial_integrations_names = list(config['integrations'].keys())
-        config_path = common.prepare_config(config, ['default_mariadb', 'default_clickhouse'])
+        cls.config = Config(common.TEST_CONFIG)
+        cls.initial_integrations_names = list(cls.config['integrations'].keys())
 
-        cls.sp = Popen(
-            ['python3', '-m', 'mindsdb', '--api', 'http', '--config', config_path],
-            close_fds=True,
-            stdout=None,
-            stderr=None
+        mdb, datastore = common.run_environment(
+            cls.config,
+            apis=['http'],
+            override_integration_config={
+                'default_mariadb': {
+                    'publish': True
+                },
+                'default_clickhouse': {
+                    'publish': True
+                }
+            },
+            mindsdb_database=common.MINDSDB_DATABASE
         )
-        for i in range(20):
-            try:
-                res = requests.get(f'{root}/util/ping')
-                if res.status_code != 200:
-                    raise Exception('')
-                else:
-                    break
-            except Exception:
-                time.sleep(1)
-                if i == 19:
-                    raise Exception("Can't connect!")
+        cls.mdb = mdb
 
     @classmethod
     def tearDownClass(cls):
@@ -65,7 +60,7 @@ class HTTPTest(unittest.TestCase):
         for integration_name in integration_names['integrations']:
             assert integration_name in self.initial_integrations_names
 
-        test_integration_data = {'enabled': False, 'host': 'test', 'type': 'clickhouse'}
+        test_integration_data = {'publish': False, 'host': 'test', 'type': 'clickhouse'}
         res = requests.put(f'{root}/config/integrations/test_integration', json={'params': test_integration_data})
         assert res.status_code == 200
 
@@ -90,7 +85,7 @@ class HTTPTest(unittest.TestCase):
             assert res.status_code == 200
 
             integration = res.json()
-            for k in ['enabled', 'host', 'port', 'type', 'user']:
+            for k in ['publish', 'host', 'port', 'type', 'user']:
                 assert k in integration
                 assert integration[k] is not None
             assert integration['password'] is None
@@ -185,16 +180,31 @@ class HTTPTest(unittest.TestCase):
         Call unexisting datasource
         then check the response is NOT FOUND
         """
-        response = requests.get(f'{root}/datasource/dummy_source')
+        response = requests.get(f'{root}/datasources/dummy_source')
         assert response.status_code == 404
 
-    def test_6_ping(self):
+    def test_6_utils(self):
         """
         Call utilities ping endpoint
         THEN check the response is success
+
+        Call utilities report_uuid endpoint
+        THEN check the response is success
+        THEN check if the report_uuid is present in the report json and well fromated
+        THEN Call the endpoint again and check that the two report_uuids returned match
         """
+
         response = requests.get(f'{root}/util/ping')
         assert response.status_code == 200
+
+        response = requests.get(f'{root}/util/report_uuid')
+        assert response.status_code == 200
+        report_uuid = response.json()['report_uuid']
+        assert report_uuid == 'no_report'
+
+        # Make sure the uuid doesn't change on subsequent requests
+        response = requests.get(f'{root}/util/report_uuid')
+        assert report_uuid == response.json()['report_uuid']
 
     def test_7_predictors(self):
         """
@@ -212,6 +222,26 @@ class HTTPTest(unittest.TestCase):
         response = requests.get(f'{root}/predictors/dummy_predictor')
         assert response.status_code == 404
 
+    def test_9_gui_is_served(self):
+        """
+        GUI downloaded and available
+        """
+        start_time = time.time()
+        index = Path(self.config.paths['static']).joinpath('index.html')
+        while index.is_file() is False and (time.time() - start_time) > 30:
+            time.sleep(1)
+        assert index.is_file()
+        response = requests.get('http://localhost:47334/')
+        assert response.status_code == 200
+        assert response.content.decode().find('<head>') > 0
+
+    def test_10_telemetry_enabled(self):
+        """
+        Call telemetry enabled
+        then check the response is status 200
+        """
+        response = requests.get(f'{root}/config/telemetry/true')
+        assert response.status_code == 200
 
 if __name__ == '__main__':
     unittest.main(failfast=True)

@@ -10,6 +10,7 @@ from mindsdb.integrations.mariadb.mariadb import Mariadb
 from mindsdb.integrations.mysql.mysql import MySQL
 from mindsdb.integrations.mssql.mssql import MSSQL
 from mindsdb.utilities.functions import cast_row_types
+from mindsdb_native.libs.helpers.general_helpers import NumpyJSONEncoder
 
 
 class MindsDBDataNode(DataNode):
@@ -45,8 +46,7 @@ class MindsDBDataNode(DataNode):
 
         model = self.mindsdb_native.get_model_data(name=table)
         columns = []
-        columns += [x['column_name'] for x in model['data_analysis']['input_columns_metadata']]
-        columns += [x['column_name'] for x in model['data_analysis']['target_columns_metadata']]
+        columns += model['data_analysis_v2']['columns']
         columns += [f'{x}_original' for x in model['predict']]
         for col in model['predict']:
             if model['data_analysis_v2'][col]['typing']['data_type'] == 'Numeric':
@@ -66,7 +66,7 @@ class MindsDBDataNode(DataNode):
             'status': x['status'],
             'accuracy': str(x['accuracy']) if x['accuracy'] is not None else None,
             'predict': ', '.join(x['predict']),
-            'select_data_query': x['data_source'],
+            'select_data_query': '',
             'external_datasource': '',  # TODO
             'training_options': ''  # TODO ?
         } for x in models]
@@ -92,7 +92,7 @@ class MindsDBDataNode(DataNode):
                 if isinstance(where_data, list) is False:
                     where_data = [where_data]
             except Exception:
-                raise ValueError(f'''Error while parse 'where_data'="{where_data}"''')
+                raise ValueError(f'''Error while parse 'when_data'="{where_data}"''')
 
         external_datasource = None
         if 'external_datasource' in where:
@@ -194,7 +194,7 @@ class MindsDBDataNode(DataNode):
 
                 data.append(row)
 
-            fields = list(model['data_analysis'].keys())
+            fields = model['data_analysis']['columns']
             field_types = {f: model['data_analysis'][f]['typing']['data_subtype'] for f in fields}
             for row in data:
                 cast_row_types(row, field_types)
@@ -215,8 +215,10 @@ class MindsDBDataNode(DataNode):
                 data.append({key: el[key] for key in keys})
                 explains.append(el.explain())
 
-            fields = [x for x in model['data_analysis_v2'].keys() if x not in ['columns_to_ignore', 'train_std_dev']]
-            field_types = {f: model['data_analysis_v2'][f]['typing']['data_subtype'] for f in fields}
+            field_types = {
+                f: model['data_analysis_v2'][f]['typing']['data_subtype']
+                for f in model['data_analysis_v2']['columns']
+            }
 
             for row in data:
                 cast_row_types(row, field_types)
@@ -231,7 +233,7 @@ class MindsDBDataNode(DataNode):
                 explanation = explains[i]
                 for key in predicted_columns:
                     row[key + '_confidence'] = explanation[key]['confidence']
-                    row[key + '_explain'] = json.dumps(explanation[key])
+                    row[key + '_explain'] = json.dumps(explanation[key], cls=NumpyJSONEncoder)
                 for key in min_max_keys:
                     row[key + '_min'] = min(explanation[key]['confidence_interval'])
                     row[key + '_max'] = max(explanation[key]['confidence_interval'])

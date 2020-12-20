@@ -5,10 +5,6 @@ from mindsdb.integrations.base import Integration
 
 
 class PostgreSQL(Integration):
-    def __init__(self, config, name):
-        self.config = config
-        self.name = name
-
     def _to_postgres_table(self, stats, predicted_cols):
         subtype_map = {
             DATA_SUBTYPES.INT: ' int8',
@@ -27,7 +23,7 @@ class PostgreSQL(Integration):
         }
 
         column_declaration = []
-        for name, column in stats.items():
+        for name in stats['columns']:
             try:
                 col_subtype = stats[name]['typing']['data_subtype']
                 new_type = subtype_map[col_subtype]
@@ -57,7 +53,7 @@ class PostgreSQL(Integration):
 
         try:
             rows = cur.fetchall()
-            keys = [k[0].decode('ascii') for k in cur.description]
+            keys = [k[0] if isinstance(k[0], str) else k[0].decode('ascii') for k in cur.description]
             res = [dict(zip(keys, row)) for row in rows]
         except Exception:
             pass
@@ -86,28 +82,28 @@ class PostgreSQL(Integration):
         except Exception:
             print('Error: cant find or activate mysql_fdw extension for PostgreSQL.')
 
-        self._query('DROP SCHEMA IF EXISTS mindsdb CASCADE')
+        self._query(f'DROP SCHEMA IF EXISTS {self.mindsdb_database} CASCADE')
 
-        self._query(f"DROP USER MAPPING IF EXISTS FOR {self.config['integrations'][self.name]['user']} SERVER mindsdb_server")
+        self._query(f"DROP USER MAPPING IF EXISTS FOR {self.config['integrations'][self.name]['user']} SERVER server_{self.mindsdb_database}")
 
-        self._query('DROP SERVER IF EXISTS mindsdb_server')
+        self._query(f'DROP SERVER IF EXISTS server_{self.mindsdb_database} CASCADE')
 
         self._query(f'''
-            CREATE SERVER mindsdb_server
+            CREATE SERVER server_{self.mindsdb_database}
                 FOREIGN DATA WRAPPER mysql_fdw
                 OPTIONS (host '{host}', port '{port}');
         ''')
 
         self._query(f'''
            CREATE USER MAPPING FOR {self.config['integrations'][self.name]['user']}
-                SERVER mindsdb_server
+                SERVER server_{self.mindsdb_database}
                 OPTIONS (username '{user}', password '{password}');
         ''')
 
-        self._query('CREATE SCHEMA mindsdb')
+        self._query(f'CREATE SCHEMA {self.mindsdb_database}')
 
-        q = """
-            CREATE FOREIGN TABLE IF NOT EXISTS mindsdb.predictors (
+        q = f"""
+            CREATE FOREIGN TABLE IF NOT EXISTS {self.mindsdb_database}.predictors (
                 name text,
                 status text,
                 accuracy text,
@@ -116,15 +112,15 @@ class PostgreSQL(Integration):
                 external_datasource text,
                 training_options text
             )
-            SERVER mindsdb_server
+            SERVER server_{self.mindsdb_database}
             OPTIONS (dbname 'mindsdb', table_name 'predictors');
         """
         self._query(q)
 
-        q = """
-            CREATE FOREIGN TABLE IF NOT EXISTS mindsdb.commands (
+        q = f"""
+            CREATE FOREIGN TABLE IF NOT EXISTS {self.mindsdb_database}.commands (
                 command text
-            ) SERVER mindsdb_server
+            ) SERVER server_{self.mindsdb_database}
             OPTIONS (dbname 'mindsdb', table_name 'commands');
         """
         self._query(q)
@@ -144,17 +140,16 @@ class PostgreSQL(Integration):
                 columns_sql += f',"{col}_explain" text'
 
             q = f"""
-                    CREATE FOREIGN TABLE mindsdb.{self._escape_table_name(name)}
-                    (
-                        {columns_sql}
-                    ) SERVER mindsdb_server
-                    OPTIONS (dbname 'mindsdb', table_name '{name}');
+                CREATE FOREIGN TABLE {self.mindsdb_database}.{self._escape_table_name(name)} (
+                    {columns_sql}
+                ) SERVER server_{self.mindsdb_database}
+                OPTIONS (dbname 'mindsdb', table_name '{name}');
             """
             self._query(q)
 
     def unregister_predictor(self, name):
         q = f"""
-            DROP FOREIGN TABLE IF EXISTS mindsdb.{self._escape_table_name(name)};
+            DROP FOREIGN TABLE IF EXISTS {self.mindsdb_database}.{self._escape_table_name(name)};
         """
         self._query(q)
 

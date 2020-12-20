@@ -30,6 +30,7 @@ from mindsdb.api.mysql.mysql_proxy.data_types.mysql_packet import Packet
 from mindsdb.api.mysql.mysql_proxy.controllers.session_controller import SessionController
 from mindsdb.api.mysql.mysql_proxy.datahub import init_datahub
 from mindsdb.api.mysql.mysql_proxy.classes.client_capabilities import ClentCapabilities
+from mindsdb.api.mysql.mysql_proxy.classes.server_capabilities import server_capabilities
 from mindsdb.api.mysql.mysql_proxy.classes.sql_statement_parser import SqlStatementParser, SQL_PARAMETER, SQL_DEFAULT
 from mindsdb.api.mysql.mysql_proxy.utilities import log
 
@@ -48,7 +49,8 @@ from mindsdb.api.mysql.mysql_proxy.libs.constants.mysql import (
     SERVER_VARIABLES,
     DEFAULT_AUTH_METHOD,
     SERVER_STATUS,
-    FIELD_FLAG
+    FIELD_FLAG,
+    CAPABILITIES
 )
 
 from mindsdb.api.mysql.mysql_proxy.data_types.mysql_packets import (
@@ -193,10 +195,11 @@ class MysqlProxy(SocketServer.BaseRequestHandler):
             log.info('switch to SSL')
             self.session.is_ssl = True
 
-            ssl_socket = ssl.wrap_socket(
+            ssl_context = ssl.SSLContext()
+            ssl_context.load_cert_chain(CERT_PATH)
+            ssl_socket = ssl_context.wrap_socket(
                 self.socket,
                 server_side=True,
-                certfile=CERT_PATH,
                 do_handshake_on_connect=True
             )
 
@@ -376,7 +379,7 @@ class MysqlProxy(SocketServer.BaseRequestHandler):
                 ).send()
                 return
             insert['select_data_query'] = insert['select_data_query'].replace(r"\'", "'")
-            ds, ds_name = default_store.save_datasource(insert['name'], integration, insert['select_data_query'])
+            ds, ds_name = default_store.save_datasource(insert['name'], integration, {'query': insert['select_data_query']})
         elif is_external_datasource:
             ds = default_store.get_datasource_obj(insert['external_datasource'], raw=True)
             ds_name = insert['external_datasource']
@@ -1462,6 +1465,11 @@ class MysqlProxy(SocketServer.BaseRequestHandler):
             make_ssl_cert(CERT_PATH)
             atexit.register(lambda: os.remove(CERT_PATH))
 
+        server_capabilities.set(
+            CAPABILITIES.CLIENT_SSL,
+            config['api']['mysql']['ssl']
+        )
+
         default_store = DataStore(config)
         mdb = MindsdbNative(config)
         custom_models = CustomModels(config)
@@ -1472,9 +1480,7 @@ class MysqlProxy(SocketServer.BaseRequestHandler):
 
         log.info(f'Starting MindsDB Mysql proxy server on tcp://{host}:{port}')
 
-        # Create the server
-        if config.get('debug') is True:
-            SocketServer.TCPServer.allow_reuse_address = True
+        SocketServer.TCPServer.allow_reuse_address = True
         server = SocketServer.ThreadingTCPServer((host, port), MysqlProxy)
 
         atexit.register(MysqlProxy.server_close, srv=server)
