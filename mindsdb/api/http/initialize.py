@@ -6,18 +6,25 @@ import threading
 import webbrowser
 from zipfile import ZipFile
 from pathlib import Path
-import logging
 import traceback
+from datetime import datetime, date, timedelta
 #import concurrent.futures
 
-from flask import Flask, url_for
+from flask import Flask, url_for, make_response
+from flask.json import dumps
 from flask_restx import Api
+from flask.json import JSONEncoder
 
 from mindsdb.__about__ import __version__ as mindsdb_version
 from mindsdb.interfaces.datastore.datastore import DataStore
-from mindsdb.interfaces.native.mindsdb import MindsdbNative
+from mindsdb.interfaces.model.model_interface import ModelInterface as NativeInterface
 from mindsdb.interfaces.custom.custom_models import CustomModels
 from mindsdb.utilities.ps import is_pid_listen_port, wait_func_is_true
+from mindsdb.interfaces.database.database import DatabaseWrapper
+from mindsdb.utilities.telemetry import inject_telemetry_to_static
+from mindsdb.utilities.config import Config
+from mindsdb.utilities.log import get_log
+from mindsdb.interfaces.storage.db import session
 
 
 class Swagger_Api(Api):
@@ -30,12 +37,30 @@ class Swagger_Api(Api):
         return url_for(self.endpoint("specs"), _external=False)
 
 
+class CustomJSONEncoder(JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, date):
+            return obj.strftime("%Y-%m-%d")
+        if isinstance(obj, datetime):
+            return obj.strftime("%Y-%m-%dT%H:%M:%S.%f")
+        if isinstance(obj, timedelta):
+            return str(obj)
+
+        return JSONEncoder.default(self, obj)
+
+
+def custom_output_json(data, code, headers=None):
+    resp = make_response(dumps(data), code)
+    resp.headers.extend(headers or {})
+    return resp
+
+
 def initialize_static(config):
     ''' Update Scout files basing on compatible-config.json content.
         Files will be downloaded and updated if new version of GUI > current.
         Current GUI version stored in static/version.txt.
     '''
-    log = logging.getLogger('mindsdb.http')
+    log = get_log('http')
     static_path = Path(config.paths['static'])
     static_path.mkdir(parents=True, exist_ok=True)
 
@@ -163,6 +188,7 @@ def initialize_static(config):
 
     except Exception as e:
         log.error(f'Error during downloading files from s3: {e}')
+        session.close()
         return False
 
     static_folder = static_path.joinpath('static')
@@ -190,32 +216,37 @@ def initialize_static(config):
         f.write(gui_version_lv.vstring)
 
     log.info(f'GUI version updated to {gui_version_lv.vstring}')
+    session.close()
     return True
 
 
-def initialize_flask(config):
+def initialize_flask(config, init_static_thread, no_studio):
     # Apparently there's a bug that causes the static path not to work if it's '/' -- https://github.com/pallets/flask/issues/3134, I think '' should achieve the same thing (???)
-    app = Flask(
-        __name__,
-        static_url_path='/static',
-        static_folder=os.path.join(config.paths['static'], 'static/')
-    )
+    if no_studio:
+        app = Flask(
+            __name__
+        )
+    else:
+        static_path = os.path.join(config.paths['static'], 'static/')
+        if os.path.isabs(static_path) is False:
+            static_path = os.path.join(os.getcwd(), static_path)
+        app = Flask(
+            __name__,
+            static_url_path='/static',
+            static_folder=static_path
+        )
 
     app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 60
     app.config['SWAGGER_HOST'] = 'http://localhost:8000/mindsdb'
+    app.json_encoder = CustomJSONEncoder
+
     authorizations = {
         'apikey': {
-            'type': 'apiKey',
+            'type': 'session',
             'in': 'query',
-            'name': 'apikey'
+            'name': 'session'
         }
     }
-
-    port = config['api']['http']['port']
-    host = config['api']['http']['host']
-    hosts = ['0.0.0.0', 'localhost', '127.0.0.1']
-    if host not in hosts:
-        hosts.append(host)
 
     api = Swagger_Api(
         app,
@@ -226,31 +257,44 @@ def initialize_flask(config):
         doc='/doc/'
     )
 
-    # NOTE rewrite it, that hotfix to see GUI link
-    log = logging.getLogger('mindsdb.http')
-    url = f'http://{host}:{port}/'
-    log.error(f' - GUI available at {url}')
+    api.representations['application/json'] = custom_output_json
 
-    pid = os.getpid()
-    x = threading.Thread(target=_open_webbrowser, args=(url, pid, port), daemon=True)
-    x.start()
+    port = config['api']['http']['port']
+    host = config['api']['http']['host']
+
+    # NOTE rewrite it, that hotfix to see GUI link
+    if not no_studio:
+        log = get_log('http')
+        if host in ('', '0.0.0.0'):
+            url = f'http://127.0.0.1:{port}/'
+        else:
+            url = f'http://{host}:{port}/'
+        log.info(f' - GUI available at {url}')
+
+        pid = os.getpid()
+        x = threading.Thread(target=_open_webbrowser, args=(url, pid, port, init_static_thread, config.paths['static']), daemon=True)
+        x.start()
 
     return app, api
 
 
-def initialize_interfaces(config, app):
-    app.default_store = DataStore(config)
-    app.mindsdb_native = MindsdbNative(config)
-    app.custom_models = CustomModels(config)
+def initialize_interfaces(app):
+    app.default_store = DataStore()
+    app.naitve_interface = NativeInterface()
+    app.custom_models = CustomModels()
+    app.dbw = DatabaseWrapper()
+    config = Config()
     app.config_obj = config
 
 
-def _open_webbrowser(url: str, pid: int, port: int):
+def _open_webbrowser(url: str, pid: int, port: int, init_static_thread, static_folder):
     """Open webbrowser with url when http service is started.
 
     If some error then do nothing.
     """
-    logger = logging.getLogger('mindsdb.http')
+    init_static_thread.join()
+    inject_telemetry_to_static(static_folder)
+    logger = get_log('http')
     try:
         is_http_active = wait_func_is_true(func=is_pid_listen_port, timeout=10,
                                            pid=pid, port=port)
@@ -259,3 +303,4 @@ def _open_webbrowser(url: str, pid: int, port: int):
     except Exception as e:
         logger.error(f'Failed to open {url} in webbrowser with exception {e}')
         logger.error(traceback.format_exc())
+    session.close()

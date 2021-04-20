@@ -4,121 +4,70 @@ import sys
 import os
 import time
 import asyncio
-import logging
 import datetime
+import signal
 
-from pkg_resources import get_distribution
 import torch.multiprocessing as mp
 
-from mindsdb.utilities.config import Config
-from mindsdb.interfaces.native.mindsdb import MindsdbNative
+from mindsdb.utilities.config import Config, STOP_THREADS_EVENT
+from mindsdb.utilities.os_specific import get_mp_context
+from mindsdb.interfaces.model.model_interface import ModelInterface as NativeInterface
+from mindsdb.interfaces.model.model_interface import ray_based
 from mindsdb.interfaces.custom.custom_models import CustomModels
 from mindsdb.api.http.start import start as start_http
 from mindsdb.api.mysql.start import start as start_mysql
 from mindsdb.api.mongo.start import start as start_mongo
-from mindsdb.utilities.fs import (
-    get_or_create_dir_struct,
-    update_versions_file,
-    archive_obsolete_predictors,
-    remove_corrupted_predictors
-)
-from mindsdb.utilities.ps import is_pid_listen_port
+from mindsdb.utilities.ps import is_pid_listen_port, get_child_pids
 from mindsdb.interfaces.database.database import DatabaseWrapper
 from mindsdb.utilities.functions import args_parse, get_all_models_meta_data
-from mindsdb.utilities.log import initialize_log
+from mindsdb.utilities.log import log
 
 
 def close_api_gracefully(apis):
     try:
         for api in apis.values():
             process = api['process']
+            childs = get_child_pids(process.pid)
+            for p in childs:
+                try:
+                    os.kill(p, signal.SIGTERM)
+                except Exception:
+                    p.kill()
             sys.stdout.flush()
             process.terminate()
             process.join()
             sys.stdout.flush()
+        os.system('ray stop --force')
     except KeyboardInterrupt:
         sys.exit(0)
 
 
 if __name__ == '__main__':
-    version_error_msg = """
-MindsDB server requires Python >= 3.6 to run
-
-Once you have Python 3.6 installed you can tun mindsdb as follows:
-
-1. create and activate venv:
-python3.6 -m venv venv
-source venv/bin/activate
-
-2. install MindsDB:
-pip3 install mindsdb
-
-3. Run MindsDB
-python3.6 -m mindsdb
-
-More instructions in https://docs.mindsdb.com
-    """
-
-    if not (sys.version_info[0] >= 3 and sys.version_info[1] >= 6):
-        print(version_error_msg)
-        exit(1)
-
     mp.freeze_support()
-
     args = args_parse()
-
-    from mindsdb.__about__ import __version__ as mindsdb_version
-
-    if args.version:
-        print(f'MindsDB {mindsdb_version}')
-        sys.exit(0)
-
-    config_path = args.config
-    if config_path is None:
-        config_dir, _ = get_or_create_dir_struct()
-        config_path = os.path.join(config_dir, 'config.json')
-
-    config = Config(config_path)
+    config = Config()
 
     if args.verbose is True:
-        config['log']['level']['console'] = 'DEBUG'
+        config.set(['log', 'level', 'console'], 'DEBUG')
+
     os.environ['DEFAULT_LOG_LEVEL'] = config['log']['level']['console']
     os.environ['LIGHTWOOD_LOG_LEVEL'] = config['log']['level']['console']
-
     config.set(['mindsdb_last_started_at'], str(datetime.datetime.now()))
 
-    initialize_log(config)
-    log = logging.getLogger('mindsdb.main')
+    # Switch to this once the native interface has it's own thread :/
+    # ctx = mp.get_context(get_mp_context())
+    ctx = mp.get_context('spawn')
+    if not ray_based:
+        from mindsdb.interfaces.model.model_controller import start as start_model_controller
+        rpc_proc = ctx.Process(target=start_model_controller,)
+        rpc_proc.start()
 
-    try:
-        lightwood_version = get_distribution('lightwood').version
-    except Exception:
-        from lightwood.__about__ import __version__ as lightwood_version
 
-    try:
-        mindsdb_native_version = get_distribution('mindsdb_native').version
-    except Exception:
-        from mindsdb_native.__about__ import __version__ as mindsdb_native_version
+    from mindsdb.__about__ import __version__ as mindsdb_version
+    print(f'Version {mindsdb_version}')
 
-    print(f'Configuration file:\n   {config_path}')
+    print(f'Configuration file:\n   {config.config_path}')
     print(f"Storage path:\n   {config.paths['root']}")
-
-    print('Versions:')
-    print(f' - lightwood {lightwood_version}')
-    print(f' - MindsDB_native {mindsdb_native_version}')
-    print(f' - MindsDB {mindsdb_version}')
-
-    os.environ['MINDSDB_STORAGE_PATH'] = config.paths['predictors']
-
-    update_versions_file(
-        config,
-        {
-            'lightwood': lightwood_version,
-            'mindsdb_native': mindsdb_native_version,
-            'mindsdb': mindsdb_version,
-            'python': sys.version.replace('\n', '')
-        }
-    )
 
     if args.api is None:
         api_arr = ['http', 'mysql']
@@ -132,12 +81,8 @@ More instructions in https://docs.mindsdb.com
             'started': False
         } for api in api_arr
     }
-
-    for api_name in apis.keys():
-        if api_name not in config['api']:
-            print(f"Trying run '{api_name}' API, but is no config for this api.")
-            print(f"Please, fill config['api']['{api_name}']")
-            sys.exit(0)
+    if not ray_based:
+        apis['rcp'] = {'process': rpc_proc, 'started': True}
 
     start_functions = {
         'http': start_http,
@@ -145,33 +90,34 @@ More instructions in https://docs.mindsdb.com
         'mongodb': start_mongo
     }
 
-    archive_obsolete_predictors(config, '2.11.0')
-
-    mdb = MindsdbNative(config)
-    cst = CustomModels(config)
-
-    remove_corrupted_predictors(config, mdb)
+    mdb = NativeInterface()
+    cst = CustomModels()
 
     model_data_arr = get_all_models_meta_data(mdb, cst)
 
-    dbw = DatabaseWrapper(config)
+    dbw = DatabaseWrapper()
+    for db_alias in config['integrations']:
+        dbw.setup_integration(db_alias)
     dbw.register_predictors(model_data_arr)
 
     for broken_name in [name for name, connected in dbw.check_connections().items() if connected is False]:
         log.error(f'Error failed to integrate with database aliased: {broken_name}')
 
-    ctx = mp.get_context('spawn')
-
     for api_name, api_data in apis.items():
+        if api_data['started']:
+            continue
         print(f'{api_name} API: starting...')
         try:
-            p = ctx.Process(target=start_functions[api_name], args=(config_path, args.verbose))
+            if api_name == 'http':
+                p = ctx.Process(target=start_functions[api_name], args=(args.verbose,args.no_studio))
+            else:
+                p = ctx.Process(target=start_functions[api_name], args=(args.verbose,))
             p.start()
             api_data['process'] = p
         except Exception as e:
-            close_api_gracefully(apis)
             log.error(f'Failed to start {api_name} API with exception {e}\n{traceback.format_exc()}')
-            raise
+            close_api_gracefully(apis)
+            raise e
 
     atexit.register(close_api_gracefully, apis=apis)
 
@@ -187,7 +133,7 @@ More instructions in https://docs.mindsdb.com
     async def wait_apis_start():
         futures = [
             wait_api_start(api_name, api_data['process'].pid, api_data['port'])
-            for api_name, api_data in apis.items()
+            for api_name, api_data in apis.items() if 'port' in api_data
         ]
         for i, future in enumerate(asyncio.as_completed(futures)):
             api_name, port, started = await future
@@ -204,4 +150,6 @@ More instructions in https://docs.mindsdb.com
         for api_data in apis.values():
             api_data['process'].join()
     except KeyboardInterrupt:
+        print('Stopping stream integrations...')
+        STOP_THREADS_EVENT.set()
         print('Closing app...')

@@ -1,22 +1,17 @@
 import time
-from pathlib import Path
+import os
 import json
-import requests
 import subprocess
 import atexit
-import os
 import asyncio
-import shutil
-import csv
+import re
+import sys
+from pathlib import Path
 
+import requests
 from pandas import DataFrame
 
-from mindsdb.utilities.fs import create_dirs_recursive
-from mindsdb.utilities.config import Config
-from mindsdb.interfaces.native.mindsdb import MindsdbNative
-from mindsdb.interfaces.datastore.datastore import DataStore
-from mindsdb.utilities.ps import wait_port, is_port_in_use
-from mindsdb_native import CONFIG
+from ps import wait_port, is_port_in_use, net_connections
 
 
 HTTP_API_ROOT = 'http://localhost:47334/api'
@@ -29,9 +24,7 @@ EXTERNAL_DB_CREDENTIALS = str(Path.home().joinpath('.mindsdb_credentials.json'))
 
 MINDSDB_DATABASE = 'mindsdb'
 
-dir_path = os.path.dirname(os.path.realpath(__file__))
-
-TEST_CONFIG = dir_path + '/config/config.json'
+TEST_CONFIG = os.path.dirname(os.path.realpath(__file__)) + '/config/config.json'
 
 TESTS_ROOT = Path(__file__).parent.absolute().joinpath('../../').resolve()
 
@@ -98,83 +91,109 @@ DATASETS_COLUMN_TYPES = {
     ]
 }
 
+CONFIG_PATH = TEMP_DIR.joinpath('config.json')
 
-def prepare_config(config, mindsdb_database='mindsdb', override_integration_config={}, override_api_config={}, clear_storage=True):
-    for key in config._config['integrations']:
-        config._config['integrations'][key]['publish'] = False
+with open(TEST_CONFIG, 'rt') as f:
+    config_json = json.loads(f.read())
+    config_json['storage_dir'] = str(TEMP_DIR)
 
-    if USE_EXTERNAL_DB_SERVER:
-        with open(EXTERNAL_DB_CREDENTIALS, 'rt') as f:
-            cred = json.loads(f.read())
-            for key in cred:
-                if f'default_{key}' in config._config['integrations']:
-                    config._config['integrations'][f'default_{key}'].update(cred[key])
 
-    for integration in override_integration_config:
-        if integration in config._config['integrations']:
-            config._config['integrations'][integration].update(override_integration_config[integration])
-        else:
-            config._config['integrations'][integration] = override_integration_config[integration]
-
-    for api in override_api_config:
-        config._config['api'][api].update(override_api_config[api])
-
-    config['api']['mysql']['database'] = mindsdb_database
-    config['api']['mongodb']['database'] = mindsdb_database
-
-    storage_dir = TEMP_DIR.joinpath('storage')
-    if storage_dir.is_dir() and clear_storage:
-        shutil.rmtree(str(storage_dir))
-    config._config['storage_dir'] = str(storage_dir)
-
-    create_dirs_recursive(config.paths)
-
-    temp_config_path = str(TEMP_DIR.joinpath('config.json').resolve())
-    with open(temp_config_path, 'wt') as f:
-        json.dump(config._config, f, indent=4, sort_keys=True)
-
-    return temp_config_path
+def close_all_ssh_tunnels():
+    RE_PORT_CONTROL = re.compile(r'^\.mindsdb-ssh-ctrl-\d+$')
+    for p in Path('/tmp/mindsdb').iterdir():
+        if p.is_socket() and p.name != '.mindsdb-ssh-ctrl-5005' and RE_PORT_CONTROL.match(p.name):
+            sp = subprocess.Popen(f'ssh -S /tmp/mindsdb/{p.name} -O exit ubuntu@3.220.66.106', shell=True)
+            sp.wait()
 
 
 def close_ssh_tunnel(sp, port):
     sp.kill()
     # NOTE line below will close connection in ALL test instances.
     # sp = subprocess.Popen(f'for pid in $(lsof -i :{port} -t); do kill -9 $pid; done', shell=True)
-    sp = subprocess.Popen(f'ssh -S /tmp/.mindsdb-ssh-ctrl-{port} -O exit ubuntu@3.220.66.106', shell=True)
+    sp = subprocess.Popen(f'ssh -S /tmp/mindsdb/.mindsdb-ssh-ctrl-{port} -O exit ubuntu@3.220.66.106', shell=True)
     sp.wait()
 
 
 def open_ssh_tunnel(port, direction='R'):
-    cmd = f'ssh -i ~/.ssh/db_machine -S /tmp/.mindsdb-ssh-ctrl-{port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -fMN{direction} 127.0.0.1:{port}:127.0.0.1:{port} ubuntu@3.220.66.106'
+    path = Path('/tmp/mindsdb')
+    if not path.is_dir():
+        path.mkdir(mode=0o777, exist_ok=True, parents=True)
+
+    if is_mssql_test() and port != 5005:
+        cmd = f'ssh -i ~/.ssh/db_machine_ms -S /tmp/mindsdb/.mindsdb-ssh-ctrl-{port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -fMN{direction} 127.0.0.1:{port}:127.0.0.1:{port} Administrator@107.21.140.172'
+    else:
+        cmd = f'ssh -i ~/.ssh/db_machine -S /tmp/mindsdb/.mindsdb-ssh-ctrl-{port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -fMN{direction} 127.0.0.1:{port}:127.0.0.1:{port} ubuntu@3.220.66.106'
     sp = subprocess.Popen(
         cmd.split(' '),
         stdout=OUTPUT,
         stderr=OUTPUT
     )
-    atexit.register(close_ssh_tunnel, sp=sp, port=port)
+    try:
+        status = sp.wait(20)
+    except subprocess.TimeoutExpired:
+        status = 1
+        sp.kill()
+
+    if status == 0:
+        atexit.register(close_ssh_tunnel, sp=sp, port=port)
+    return status
+
+
+def is_mssql_test():
+    for x in sys.argv:
+        if 'test_mssql.py' in x:
+            return True
+    return False
 
 
 if USE_EXTERNAL_DB_SERVER:
-    config = Config(TEST_CONFIG)
     open_ssh_tunnel(5005, 'L')
     wait_port(5005, timeout=10)
-    r = requests.get('http://127.0.0.1:5005/port')
-    if r.status_code != 200:
-        raise Exception('Cant get port to run mindsdb')
-    mindsdb_port = r.content.decode()
-    open_ssh_tunnel(mindsdb_port, 'R')
+
+    close_all_ssh_tunnels()
+
+    for _ in range(10):
+        r = requests.get('http://127.0.0.1:5005/port')
+        if r.status_code != 200:
+            raise Exception('Cant get port to run mindsdb')
+        mindsdb_port = r.content.decode()
+        status = open_ssh_tunnel(mindsdb_port, 'R')
+        if status == 0:
+            break
+    else:
+        raise Exception('Cant get empty port to run mindsdb')
+
     print(f'use mindsdb port={mindsdb_port}')
-    config._config['api']['mysql']['port'] = mindsdb_port
-    config._config['api']['mongodb']['port'] = mindsdb_port
+    config_json['api']['mysql']['port'] = mindsdb_port
+    config_json['api']['mongodb']['port'] = mindsdb_port
 
     MINDSDB_DATABASE = f'mindsdb_{mindsdb_port}'
+    config_json['api']['mysql']['database'] = MINDSDB_DATABASE
+    config_json['api']['mongodb']['database'] = MINDSDB_DATABASE
+
+    config_json['company_id'] = mindsdb_port
 
     with open(EXTERNAL_DB_CREDENTIALS, 'rt') as f:
         credentials = json.loads(f.read())
     override = {}
     for key, value in credentials.items():
-        override[f'default_{key}'] = value
-    TEST_CONFIG = prepare_config(config, override_integration_config=override)
+        value['publish'] = False
+        value['type'] = key
+        config_json['integrations'][f'default_{key}'] = value
+
+    AWS_ACCESS_KEY_ID = os.environ.get('AWS_ACCESS_KEY_ID', None)
+    AWS_SECRET_ACCESS_KEY = os.environ.get('AWS_SECRET_ACCESS_KEY', None)
+    if AWS_SECRET_ACCESS_KEY is not None and AWS_ACCESS_KEY_ID is not None:
+        if 'permanent_storage' not in config_json:
+            config_json['permanent_storage'] = {}
+        config_json['permanent_storage']['s3_credentials'] = {
+            'aws_access_key_id': AWS_ACCESS_KEY_ID,
+            'aws_secret_access_key': AWS_SECRET_ACCESS_KEY
+        }
+
+    config_json['permanent_storage'] = {
+        'bucket': 'mindsdb-cloud-storage-v1'
+    }
 
 
 def make_test_csv(name, data):
@@ -187,27 +206,67 @@ def make_test_csv(name, data):
 def stop_mindsdb(sp=None):
     if sp:
         sp.kill()
-    sp = subprocess.Popen('kill -9 $(lsof -t -i:47334)', shell=True)
-    sp.wait()
-    sp = subprocess.Popen('kill -9 $(lsof -t -i:47335)', shell=True)
-    sp.wait()
-    sp = subprocess.Popen('kill -9 $(lsof -t -i:47336)', shell=True)
-    sp.wait()
+    try:
+        os.system('ray stop --force')
+    except Exception as e:
+        print(e)
+        pass
+    try:
+        os.system('sudo ray stop --force')
+    except Exception as e:
+        print(e)
+        pass
+
+    conns = net_connections()
+    pids = [x.pid for x in conns
+            if x.pid is not None and x.status in ['LISTEN', 'CLOSE_WAIT']
+            and x.laddr[1] in (47334, 47335, 47336, 19329, 8273, 8274, 8275)]
+
+    for pid in pids:
+        try:
+            os.kill(pid, 9)
+        # process may be killed by OS due to some reasons in that moment
+        except ProcessLookupError:
+            pass
+    time.sleep(6)
+
+def override_recursive(a, b):
+    for key in b:
+        if isinstance(b[key], dict) is False:
+            a[key] = b[key]
+        elif key not in a or isinstance(a[key], dict) is False:
+            a[key] = b[key]
+        else:
+            override_recursive(a[key], b[key])
 
 
-def run_environment(config, apis=['mysql'], override_integration_config={}, override_api_config={}, mindsdb_database='mindsdb', clear_storage=True):
-    temp_config_path = prepare_config(config, mindsdb_database, override_integration_config, override_api_config, clear_storage)
-    config = Config(temp_config_path)
-
+def run_environment(apis, override_config={}):
     api_str = ','.join(apis)
+
+    override_recursive(config_json, override_config)
+
+    with open(CONFIG_PATH, 'wt') as f:
+        f.write(json.dumps(config_json))
+
+    os.environ['CHECK_FOR_UPDATES'] = '0'
+    print('Starting mindsdb process!')
+    try:
+        os.system('ray stop --force')
+    except Exception:
+        pass
+    try:
+        os.system('sudo ray stop --force')
+    except Exception:
+        pass
     sp = subprocess.Popen(
-        ['python3', '-m', 'mindsdb', '--api', api_str, '--config', temp_config_path],
+        ['python3', '-m', 'mindsdb', f'--api={api_str}', f'--config={CONFIG_PATH}', '--verbose'],
         close_fds=True,
         stdout=OUTPUT,
         stderr=OUTPUT
     )
     atexit.register(stop_mindsdb, sp=sp)
 
+    print('Waiting on ports!')
     async def wait_port_async(port, timeout):
         start_time = time.time()
         started = is_port_in_use(port)
@@ -217,13 +276,13 @@ def run_environment(config, apis=['mysql'], override_integration_config={}, over
         return started
 
     async def wait_apis_start(ports):
-        futures = [wait_port_async(port, 60) for port in ports]
+        futures = [wait_port_async(port, 200) for port in ports]
         success = True
         for i, future in enumerate(asyncio.as_completed(futures)):
             success = success and await future
         return success
 
-    ports_to_wait = [config['api'][api]['port'] for api in apis]
+    ports_to_wait = [config_json['api'][api]['port'] for api in apis]
 
     ioloop = asyncio.get_event_loop()
     if ioloop.is_closed():
@@ -232,42 +291,7 @@ def run_environment(config, apis=['mysql'], override_integration_config={}, over
     ioloop.close()
     if not success:
         raise Exception('Cant start mindsdb apis')
-
-    CONFIG.MINDSDB_STORAGE_PATH = config.paths['predictors']
-    mdb = MindsdbNative(config)
-    datastore = DataStore(config)
-
-    return mdb, datastore
-
-
-def upload_csv(query, columns_map, db_types_map, table_name, csv_path, escape='`', template=None):
-    template = template or 'create table test_data.%s (%s);'
-    query(template % (
-        table_name,
-        ','.join([f'{escape}{col_name}{escape} {db_types_map[col_type]}' for col_name, col_type in columns_map])
-    ))
-
-    with open(csv_path) as f:
-        csvf = csv.reader(f)
-        for i, row in enumerate(csvf):
-            if i == 0:
-                continue
-            if i % 100 == 0:
-                print(f'inserted {i} rows')
-            vals = []
-            for i, col in enumerate(columns_map):
-                col_type = col[1]
-                try:
-                    if col_type is int:
-                        vals.append(str(int(float(row[i]))))
-                    elif col_type is str:
-                        vals.append(f"'{row[i]}'")
-                    else:
-                        vals.append(str(col_type(row[i])))
-                except Exception:
-                    vals.append('null')
-
-            query(f'''INSERT INTO test_data.{table_name} VALUES ({','.join(vals)})''')
+    print('Done waiting, mindsdb has started!')
 
 
 def condition_dict_to_str(condition):

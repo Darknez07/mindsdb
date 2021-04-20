@@ -3,61 +3,66 @@ from mindsdb.integrations.postgres.postgres import PostgreSQL
 from mindsdb.integrations.mariadb.mariadb import Mariadb
 from mindsdb.integrations.mysql.mysql import MySQL
 from mindsdb.integrations.mssql.mssql import MSSQL
+from mindsdb.integrations.mongodb.mongodb import MongoDB
+from mindsdb.integrations.redis.redisdb import Redis
+from mindsdb.integrations.kafka.kafkadb import Kafka
 
 from mindsdb.utilities.log import log as logger
+from mindsdb.utilities.config import Config
 
 
 class DatabaseWrapper():
+    known_dbs = {'clickhouse': Clickhouse,
+                 'mariadb': Mariadb,
+                 'mysql': MySQL,
+                 'postgres': PostgreSQL,
+                 'mssql': MSSQL,
+                 'mongodb': MongoDB,
+                 'redis': Redis,
+                 'kafka': Kafka}
+    def __init__(self):
+        self.config = Config()
 
-    def __init__(self, config):
-        self.config = config
-        self._get_integrations()
-
-    def _setup_integration(self, integration):
-        success = False
+    def setup_integration(self, db_alias):
         try:
-            integration.setup()
-            success = True
+            # If this is the name of an integration
+            integration = self._get_integration(db_alias)
+            if integration == False:
+                raise Exception(f'Unkonw database integration type for: {db_alias}')
+            if integration != True:
+                integration.setup()
         except Exception as e:
-            print('Failed to integrate with database ' + integration.name + f', error: {e}')
-        return success
+            logger.warning('Failed to integrate with database ' + db_alias + f', error: {e}')
+
+    def _get_integration(self, db_alias):
+        if self.config['integrations'][db_alias]['publish']:
+            db_type = self.config['integrations'][db_alias]['type']
+            if db_type in self.known_dbs:
+                return self.known_dbs[db_type](self.config, db_alias)
+            logger.warning(f'Uknown integration type: {db_type} for database called: {db_alias}')
+            return False
+        return True
 
     def _get_integrations(self):
-        # @TODO Once we have a presistent state sorted out this should be simplified as to not refresh the existing integrations every single time
-        integration_arr = []
-        for db_alias in self.config['integrations']:
-            if self.config['integrations'][db_alias]['publish']:
-                db_type = self.config['integrations'][db_alias]['type']
-                if db_type == 'clickhouse':
-                    integration_arr.append(Clickhouse(self.config, db_alias))
-                elif db_type == 'mariadb':
-                    integration_arr.append(Mariadb(self.config, db_alias))
-                elif db_type == 'mysql':
-                    integration_arr.append(MySQL(self.config, db_alias))
-                elif db_type == 'postgres':
-                    integration_arr.append(PostgreSQL(self.config, db_alias))
-                elif db_type == 'mssql':
-                    integration_arr.append(MSSQL(self.config, db_alias))
-                elif db_type == 'mongodb':
-                    pass
-                else:
-                    print(f'Uknown integration type: {db_type} for database called: {db_alias}')
+        integrations = [self._get_integration(x) for x in self.config['integrations']]
+        integrations = [x for x in integrations if x != True and x != False]
+        return integrations
 
-        return integration_arr
+    def register_predictors(self, model_data_arr, integration_name=None):
+        if integration_name is None:
+            integrations = self._get_integrations()
+        else:
+            integration = self._get_integration(integration_name)
+            integrations = [] if isinstance(integration, bool) else [integration]
 
-    def register_predictors(self, model_data_arr, setup=True):
-        it = self._get_integrations()
-        for integration in it:
-            register = True
-            if setup:
-                register = self._setup_integration(integration)
-            if register:
-                if integration.check_connection():
+        for integration in integrations:
+            if integration.check_connection():
+                try:
                     integration.register_predictors(model_data_arr)
-                else:
-                    logger.warning(f"There is no connection to {integration.name}. predictor wouldn't be registred.")
-
-            integration = [integration]
+                except Exception as e:
+                    logger.warning(f"Error {e} when trying to register predictor to {integration.name}. Predictor wouldn't be registred.")
+            else:
+                logger.warning(f"There is no connection to {integration.name}. Predictor wouldn't be registred.")
 
     def unregister_predictor(self, name):
         for integration in self._get_integrations():

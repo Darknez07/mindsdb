@@ -1,11 +1,38 @@
 import requests
 
-from mindsdb_native.libs.constants.mindsdb import DATA_SUBTYPES
+from mindsdb.utilities.subtypes import DATA_SUBTYPES
 from mindsdb.integrations.base import Integration
+from mindsdb.utilities.log import log
 
 
-class Clickhouse(Integration):
-    def _to_clickhouse_table(self, stats, predicted_cols):
+class ClickhouseConnectionChecker:
+    def __init__(self, **kwargs):
+        self.host = kwargs.get("host")
+        self.port = kwargs.get("port")
+        self.user = kwargs.get("user")
+        self.password = kwargs.get("password")
+
+    def check_connection(self):
+        try:
+            res = requests.post(f"http://{self.host}:{self.port}",
+                                data="select 1;",
+                                params={'user': self.user, 'password': self.password})
+            connected = res.status_code == 200
+        except Exception:
+            connected = False
+        return connected
+
+
+class Clickhouse(Integration, ClickhouseConnectionChecker):
+    def __init__(self, config, name):
+        super().__init__(config, name)
+        db_info = self.config['integrations'][self.name]
+        self.user = db_info.get('user', 'default')
+        self.password = db_info.get('password', None)
+        self.host = db_info.get('host')
+        self.port = db_info.get('port')
+
+    def _to_clickhouse_table(self, stats, predicted_cols, columns):
         subtype_map = {
             DATA_SUBTYPES.INT: 'Nullable(Int64)',
             DATA_SUBTYPES.FLOAT: 'Nullable(Float64)',
@@ -14,6 +41,7 @@ class Clickhouse(Integration):
             DATA_SUBTYPES.TIMESTAMP: 'Nullable(Datetime)',
             DATA_SUBTYPES.SINGLE: 'Nullable(String)',
             DATA_SUBTYPES.MULTIPLE: 'Nullable(String)',
+            DATA_SUBTYPES.TAGS: 'Nullable(String)',
             DATA_SUBTYPES.IMAGE: 'Nullable(String)',
             DATA_SUBTYPES.VIDEO: 'Nullable(String)',
             DATA_SUBTYPES.AUDIO: 'Nullable(String)',
@@ -23,7 +51,7 @@ class Clickhouse(Integration):
         }
 
         column_declaration = []
-        for name in stats['columns']:
+        for name in columns:
             try:
                 col_subtype = stats[name]['typing']['data_subtype']
                 new_type = subtype_map[col_subtype]
@@ -31,8 +59,7 @@ class Clickhouse(Integration):
                 if name in predicted_cols:
                     column_declaration.append(f' `{name}_original` {new_type} ')
             except Exception as e:
-                print(e)
-                print(f'Error: cant convert type {col_subtype} of column {name} to clickhouse type')
+                log.error(f'Error: can not determine clickhouse data type for column {name}: {e}')
 
         return column_declaration
 
@@ -94,16 +121,15 @@ class Clickhouse(Integration):
     def register_predictors(self, model_data_arr):
         for model_meta in model_data_arr:
             name = self._escape_table_name(model_meta['name'])
-            stats = model_meta['data_analysis']
 
-            columns_sql = ','.join(self._to_clickhouse_table(stats, model_meta['predict']))
+            columns_sql = ','.join(self._to_clickhouse_table(model_meta['data_analysis_v2'], model_meta['predict'], model_meta['columns']))
             columns_sql += ',`when_data` Nullable(String)'
             columns_sql += ',`select_data_query` Nullable(String)'
             columns_sql += ',`external_datasource` Nullable(String)'
             for col in model_meta['predict']:
                 columns_sql += f',`{col}_confidence` Nullable(Float64)'
-                
-                if model_meta['data_analysis'][col]['typing']['data_type'] == 'Numeric':
+
+                if model_meta['data_analysis_v2'][col]['typing']['data_type'] == 'Numeric':
                     columns_sql += f',`{col}_min` Nullable(Float64)'
                     columns_sql += f',`{col}_max` Nullable(Float64)'
                 columns_sql += f',`{col}_explain` Nullable(String)'
@@ -125,10 +151,12 @@ class Clickhouse(Integration):
         """
         self._query(q)
 
-    def check_connection(self):
-        try:
-            res = self._query('select 1;')
-            connected = res.status_code == 200
-        except Exception:
-            connected = False
-        return connected
+    # def check_connection(self):
+    #     try:
+    #         res = requests.post(f"http://{self.host}:{self.port}",
+    #                             data="select 1;",
+    #                             params={'user': self.user, 'password': self.password})
+    #         connected = res.status_code == 200
+    #     except Exception:
+    #         connected = False
+    #     return connected

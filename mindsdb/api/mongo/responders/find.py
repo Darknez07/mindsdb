@@ -1,4 +1,5 @@
 from bson.int64 import Int64
+from collections import OrderedDict
 
 from mindsdb.api.mongo.classes import Responder
 import mindsdb.api.mongo.functions as helpers
@@ -27,7 +28,7 @@ class Responce(Responder):
             model = mindsdb_env['mindsdb_native'].get_model_data(name=query['find'])
 
             columns = []
-            columns += model['data_analysis_v2']['columns']
+            columns += model['columns']
             columns += [f'{x}_original' for x in model['predict']]
             for col in model['predict']:
                 if model['data_analysis_v2'][col]['typing']['data_type'] == 'Numeric':
@@ -37,27 +38,68 @@ class Responce(Responder):
 
             columns += ['when_data', 'select_data_query', 'external_datasource']
 
-            for key in where_data:
-                if key not in columns:
-                    raise Exception(f"Unknown column '{key}'. Only columns from this list can be used in query: {', '.join(columns)}")
+            where_data_list = where_data if isinstance(where_data, list) else [where_data]
+            for statement in where_data_list:
+                if isinstance(statement, dict):
+                    for key in statement:
+                        if key not in columns:
+                            columns.append(key)
 
-            prediction = mindsdb_env['mindsdb_native'].predict(name=table, when_data=where_data)
+            datasource = where_data
+            if 'select_data_query' in where_data:
+                integrations = mindsdb_env['config']['integrations'].keys()
+                connection = where_data.get('connection')
+                if connection is None:
+                    if 'default_mongodb' in integrations:
+                        connection = 'default_mongodb'
+                    else:
+                        for integration in integrations:
+                            if integration.startswith('mongodb_'):
+                                connection = integration
+                                break
+
+                if connection is None:
+                    raise Exception("Can't find connection from which fetch data")
+
+                ds_name = 'temp'
+
+                ds, ds_name = mindsdb_env['data_store'].save_datasource(
+                    name=ds_name,
+                    source_type=connection,
+                    source=where_data['select_data_query']
+                )
+                datasource = mindsdb_env['data_store'].get_datasource_obj(ds_name, raw=True)
+
+
+            if 'external_datasource' in where_data:
+                ds_name = where_data['external_datasource']
+                if mindsdb_env['data_store'].get_datasource(ds_name) is None:
+                    raise Exception(f"Datasource {ds_name} not exists")
+                datasource = mindsdb_env['data_store'].get_datasource_obj(ds_name, raw=True)
+
+            if isinstance(datasource, OrderedDict):
+                datasource = dict(datasource)
+
+            prediction = mindsdb_env['mindsdb_native'].predict(table, 'dict&explain', when_data=datasource)
+            if 'select_data_query' in where_data:
+                mindsdb_env['data_store'].delete_datasource(ds_name)
+
+            pred_dict_arr, explanations = prediction
 
             predicted_columns = model['predict']
 
             data = []
-            keys = [x for x in list(prediction._data.keys()) if x in columns]
+            keys = [k for k in pred_dict_arr[0] if k in columns]
             min_max_keys = []
             for col in predicted_columns:
                 if model['data_analysis_v2'][col]['typing']['data_type'] == 'Numeric':
                     min_max_keys.append(col)
 
-            length = len(prediction._data[predicted_columns[0]])
-            for i in range(length):
+            for i in range(len(pred_dict_arr)):
                 row = {}
-                explanation = prediction[i].explain()
+                explanation = explanations[i]
                 for key in keys:
-                    row[key] = prediction._data[key][i]
+                    row[key] = pred_dict_arr[i][key]
 
                 for key in predicted_columns:
                     row[key + '_confidence'] = explanation[key]['confidence']

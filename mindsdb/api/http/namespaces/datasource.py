@@ -11,6 +11,7 @@ from flask import request, send_file
 from flask_restx import Resource, abort     # 'abort' using to return errors as json: {'message': 'error text'}
 from flask import current_app as ca
 
+from mindsdb.utilities.log import log
 from mindsdb.api.http.namespaces.configs.datasources import ns_conf
 from mindsdb.api.http.namespaces.entitites.datasources.datasource import (
     datasource_metadata,
@@ -77,7 +78,7 @@ class Datasource(Resource):
         try:
             ca.default_store.delete_datasource(name)
         except Exception as e:
-            print(e)
+            log.error(e)
             abort(400, str(e))
         return '', 200
 
@@ -129,9 +130,16 @@ class Datasource(Resource):
 
         if 'query' in data:
             source_type = request.json['integration_id']
-            ca.default_store.save_datasource(name, source_type, request.json)
+            if source_type not in ca.default_store.config['integrations']:
+                # integration doens't exist
+                abort(400, f"{source_type} integration doesn't exist")
+
+            if ca.default_store.config['integrations'][source_type]['type'] == 'mongodb':
+                data['find'] = data['query']
+
+            ds_obj, ds_name = ca.default_store.save_datasource(name, source_type, data)
             os.rmdir(temp_dir_path)
-            return ca.default_store.get_datasource(name)
+            return ca.default_store.get_datasource(ds_name)
 
         ds_name = data['name'] if 'name' in data else name
         source = data['source'] if 'source' in data else name
@@ -142,42 +150,33 @@ class Datasource(Resource):
         else:
             file_path = None
 
-        ca.default_store.save_datasource(ds_name, source_type, source, file_path)
+        ds_obj, ds_name = ca.default_store.save_datasource(ds_name, source_type, source, file_path)
         os.rmdir(temp_dir_path)
 
         return ca.default_store.get_datasource(ds_name)
 
 
-ds_analysis = {}
-
-
 def analyzing_thread(name, default_store):
-    global ds_analysis
-    ds_analysis[name] = None
-    ds = default_store.get_datasource(name)
-    analysis = default_store.get_analysis(ds['name'])
-    ds_analysis[name] = {
-        'created_at': datetime.datetime.utcnow(),
-        'data': analysis
-    }
-
+    try:
+        from mindsdb.interfaces.storage.db import session
+        analysis = default_store.start_analysis(name)
+        session.close()
+    except Exception as e:
+        log.error(e)
 
 @ns_conf.route('/<name>/analyze')
 @ns_conf.param('name', 'Datasource name')
 class Analyze(Resource):
     @ns_conf.doc('analyse_dataset')
     def get(self, name):
-        global ds_analysis
-        if name in ds_analysis:
-            if ds_analysis[name] is None:
-                return {'status': 'analyzing'}, 200
-            else:
-                analysis = ds_analysis[name]['data']
-                return analysis, 200
+        analysis = ca.default_store.get_analysis(name)
+        if analysis is not None:
+            return analysis, 200
+
 
         ds = ca.default_store.get_datasource(name)
         if ds is None:
-            print('No valid datasource given')
+            log.error('No valid datasource given')
             abort(400, 'No valid datasource given')
 
         x = threading.Thread(target=analyzing_thread, args=(name, ca.default_store))
@@ -189,47 +188,18 @@ class Analyze(Resource):
 class Analyze(Resource):
     @ns_conf.doc('analyze_refresh_dataset')
     def get(self, name):
-        global ds_analysis
-        if name in ds_analysis:
-            if ds_analysis[name] is None:
-                return {'status': 'analyzing'}, 200
-            else:
-                del ds_analysis[name]
+        analysis = ca.default_store.get_analysis(name)
+        if analysis is not None:
+            return analysis, 200
 
         ds = ca.default_store.get_datasource(name)
         if ds is None:
-            print('No valid datasource given')
+            log.error('No valid datasource given')
             abort(400, 'No valid datasource given')
 
         x = threading.Thread(target=analyzing_thread, args=(name, ca.default_store))
         x.start()
         return {'status': 'analyzing'}, 200
-
-
-@ns_conf.route('/<name>/analyze_subset')
-@ns_conf.param('name', 'Datasource name')
-class AnalyzeSubset(Resource):
-    @ns_conf.doc('analyse_datasubset')
-    def get(self, name):
-        ds = ca.default_store.get_datasource(name)
-        if ds is None:
-            print('No valid datasource given')
-            abort(400, 'No valid datasource given')
-
-        where = []
-        for key, value in request.args.items():
-            if key.startswith('filter'):
-                param = parse_filter(key, value)
-                if param is None:
-                    abort(400, f'Not valid filter "{key}"')
-                where.append(param)
-
-        data_dict = ca.default_store.get_data(ds['name'], where)
-
-        if data_dict['rowcount'] == 0:
-            return abort(400, 'Empty dataset after filters applying')
-
-        return get_analysis(pd.DataFrame(data_dict['data'])), 200
 
 
 @ns_conf.route('/<name>/data/')
@@ -260,7 +230,6 @@ class DatasourceData(Resource):
                 where.append(param)
 
         data_dict = ca.default_store.get_data(name, where, params['page[size]'], params['page[offset]'])
-
         return data_dict, 200
 
 

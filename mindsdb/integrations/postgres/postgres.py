@@ -1,11 +1,50 @@
+from contextlib import closing
 import pg8000
 
-from mindsdb_native.libs.constants.mindsdb import DATA_SUBTYPES
+from mindsdb.utilities.subtypes import DATA_SUBTYPES
 from mindsdb.integrations.base import Integration
+from mindsdb.utilities.log import log
 
 
-class PostgreSQL(Integration):
-    def _to_postgres_table(self, stats, predicted_cols):
+class PostgreSQLConnectionChecker:
+    def __init__(self, **kwargs):
+        self.host = kwargs.get('host')
+        self.port = kwargs.get('port')
+        self.user = kwargs.get('user')
+        self.password = kwargs.get('password')
+        self.database = kwargs.get('database', 'postgres')
+
+    def _get_connection(self):
+        return pg8000.connect(
+            database=self.database,
+            user=self.user,
+            password=self.password,
+            host=self.host,
+            port=self.port
+        )
+
+    def check_connection(self):
+        try:
+            con = self._get_connection()
+            with closing(con) as con:
+                con.run('select 1;')
+            connected = True
+        except Exception:
+            connected = False
+        return connected
+
+
+class PostgreSQL(Integration, PostgreSQLConnectionChecker):
+    def __init__(self, config, name):
+        super().__init__(config, name)
+        db_info = self.config['integrations'][self.name]
+        self.user = db_info.get('user')
+        self.password = db_info.get('password')
+        self.host = db_info.get('host')
+        self.port = db_info.get('port')
+        self.database = db_info.get('database', 'postgres')
+
+    def _to_postgres_table(self, stats, predicted_cols, columns):
         subtype_map = {
             DATA_SUBTYPES.INT: ' int8',
             DATA_SUBTYPES.FLOAT: 'float8',
@@ -14,6 +53,7 @@ class PostgreSQL(Integration):
             DATA_SUBTYPES.TIMESTAMP: 'timestamp',
             DATA_SUBTYPES.SINGLE: 'text',
             DATA_SUBTYPES.MULTIPLE: 'text',
+            DATA_SUBTYPES.TAGS: 'text',
             DATA_SUBTYPES.IMAGE: 'text',
             DATA_SUBTYPES.VIDEO: 'text',
             DATA_SUBTYPES.AUDIO: 'text',
@@ -23,15 +63,15 @@ class PostgreSQL(Integration):
         }
 
         column_declaration = []
-        for name in stats['columns']:
+        for name in columns:
             try:
                 col_subtype = stats[name]['typing']['data_subtype']
                 new_type = subtype_map[col_subtype]
                 column_declaration.append(f' "{name}" {new_type} ')
                 if name in predicted_cols:
                     column_declaration.append(f' "{name}_original" {new_type} ')
-            except Exception:
-                print(f'Error: cant convert type {col_subtype} of column {name} to Postgres type')
+            except Exception as e:
+                log.error(f'Error: can not determine postgres data type for column {name}: {e}')
 
         return column_declaration
 
@@ -39,27 +79,21 @@ class PostgreSQL(Integration):
         return '"' + name.replace('"', '""') + '"'
 
     def _query(self, query):
-        con = pg8000.connect(
-            database=self.config['integrations'][self.name].get('database', 'postgres'),
-            user=self.config['integrations'][self.name]['user'],
-            password=self.config['integrations'][self.name]['password'],
-            host=self.config['integrations'][self.name]['host'],
-            port=self.config['integrations'][self.name]['port']
-        )
+        con = self._get_connection()
+        with closing(con) as con:
 
-        cur = con.cursor()
-        res = True
-        cur.execute(query)
+            cur = con.cursor()
+            res = True
+            cur.execute(query)
 
-        try:
-            rows = cur.fetchall()
-            keys = [k[0] if isinstance(k[0], str) else k[0].decode('ascii') for k in cur.description]
-            res = [dict(zip(keys, row)) for row in rows]
-        except Exception:
-            pass
+            try:
+                rows = cur.fetchall()
+                keys = [k[0] if isinstance(k[0], str) else k[0].decode('ascii') for k in cur.description]
+                res = [dict(zip(keys, row)) for row in rows]
+            except Exception:
+                pass
 
-        con.commit()
-        con.close()
+            con.commit()
 
         return res
 
@@ -128,13 +162,13 @@ class PostgreSQL(Integration):
     def register_predictors(self, model_data_arr):
         for model_meta in model_data_arr:
             name = model_meta['name']
-            stats = model_meta['data_analysis']
-            columns_sql = ','.join(self._to_postgres_table(stats, model_meta['predict']))
+            data_analysis_v2 = model_meta['data_analysis_v2']
+            columns_sql = ','.join(self._to_postgres_table(data_analysis_v2, model_meta['predict'], model_meta['columns']))
             columns_sql += ',"select_data_query" text'
             columns_sql += ',"external_datasource" text'
             for col in model_meta['predict']:
                 columns_sql += f',"{col}_confidence" float8'
-                if model_meta['data_analysis'][col]['typing']['data_type'] == 'Numeric':
+                if data_analysis_v2[col]['typing']['data_type'] == 'Numeric':
                     columns_sql += f',"{col}_min" float8'
                     columns_sql += f',"{col}_max" float8'
                 columns_sql += f',"{col}_explain" text'
@@ -152,19 +186,3 @@ class PostgreSQL(Integration):
             DROP FOREIGN TABLE IF EXISTS {self.mindsdb_database}.{self._escape_table_name(name)};
         """
         self._query(q)
-
-    def check_connection(self):
-        try:
-            con = pg8000.connect(
-                database=self.config['integrations'][self.name].get('database', 'postgres'),
-                user=self.config['integrations'][self.name]['user'],
-                password=self.config['integrations'][self.name]['password'],
-                host=self.config['integrations'][self.name]['host'],
-                port=self.config['integrations'][self.name]['port']
-            )
-            con.run('select 1;')
-            con.close()
-            connected = True
-        except Exception:
-            connected = False
-        return connected

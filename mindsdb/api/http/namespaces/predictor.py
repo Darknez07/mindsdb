@@ -9,6 +9,7 @@ from flask import request, send_file
 from flask_restx import Resource, abort
 from flask import current_app as ca
 
+from mindsdb.utilities.log import log
 from mindsdb.api.http.namespaces.configs.predictors import ns_conf
 from mindsdb.api.http.namespaces.entitites.predictor_metadata import (
     predictor_metadata,
@@ -17,40 +18,6 @@ from mindsdb.api.http.namespaces.entitites.predictor_metadata import (
     put_predictor_params
 )
 from mindsdb.api.http.namespaces.entitites.predictor_status import predictor_status
-
-
-def debug_pkey_type(model, keys=None, reset_keyes=True, type_to_check=list, append_key=True):
-    if type(model) != dict:
-        return
-    for k in model:
-        if reset_keyes:
-            keys = []
-        if type(model[k]) == dict:
-            keys.append(k)
-            debug_pkey_type(model[k], copy.deepcopy(keys), reset_keyes=False)
-        if type(model[k]) == type_to_check:
-            print(f'They key {keys}->{k} has type list')
-        if type(model[k]) == list:
-            for item in model[k]:
-                debug_pkey_type(item, copy.deepcopy(keys), reset_keyes=False)
-
-
-def preparse_results(results, format_flag='explain'):
-    response_arr = []
-    for res in results:
-        if format_flag == 'explain':
-            response_arr.append(res.explain())
-        elif format_flag == 'epitomize':
-            response_arr.append(res.epitomize())
-        elif format_flag == 'new_explain':
-            response_arr.append(res.explanation)
-        else:
-            response_arr.append(res.explain())
-
-    if len(response_arr) > 0:
-        return response_arr
-    else:
-        abort(400, "")
 
 def is_custom(name):
     if name in [x['name'] for x in ca.custom_models.get_models()]:
@@ -64,7 +31,7 @@ class PredictorList(Resource):
     def get(self):
         '''List all predictors'''
 
-        return [*ca.mindsdb_native.get_models(),*ca.custom_models.get_models()]
+        return [*ca.naitve_interface.get_models(),*ca.custom_models.get_models()]
 
 @ns_conf.route('/custom/<name>')
 @ns_conf.param('name', 'The predictor identifier')
@@ -74,7 +41,7 @@ class CustomPredictor(Resource):
     def put(self, name):
         try:
             trained_status = request.json['trained_status']
-        except:
+        except Exception:
             trained_status = 'untrained'
 
         predictor_file = request.files['file']
@@ -97,7 +64,7 @@ class Predictor(Resource):
             if is_custom(name):
                 model = ca.custom_models.get_model_data(name)
             else:
-                model = ca.mindsdb_native.get_model_data(name, native_view=True)
+                model = ca.naitve_interface.get_model_data(name, db_fix=False)
         except Exception as e:
             abort(404, "")
 
@@ -113,7 +80,7 @@ class Predictor(Resource):
         if is_custom(name):
             ca.custom_models.delete_model(name)
         else:
-            ca.mindsdb_native.delete_model(name)
+            ca.naitve_interface.delete_model(name)
 
         return '', 200
 
@@ -125,7 +92,7 @@ class Predictor(Resource):
 
         try:
             kwargs = data.get('kwargs')
-        except:
+        except Exception:
             kwargs = None
 
         if type(kwargs) != type({}):
@@ -159,20 +126,20 @@ class Predictor(Resource):
             original_name = name
             name = name + '_retrained'
 
-        ca.mindsdb_native.learn(name, from_data, to_predict, kwargs)
+        ca.naitve_interface.learn(name, from_data, to_predict, ca.default_store.get_datasource(ds_name)['id'], kwargs)
         for i in range(20):
             try:
                 # Dirty hack, we should use a messaging queue between the predictor process and this bit of the code
-                ca.mindsdb_native.get_model_data(name)
+                ca.naitve_interface.get_model_data(name)
                 break
             except Exception:
                 time.sleep(1)
 
         if retrain is True:
             try:
-                ca.mindsdb_native.delete_model(original_name)
-                ca.mindsdb_native.rename_model(name, original_name)
-            except:
+                ca.naitve_interface.delete_model(original_name)
+                ca.naitve_interface.rename_model(name, original_name)
+            except Exception:
                 pass
 
         return '', 200
@@ -195,38 +162,20 @@ class PredictorLearn(Resource):
         ds_name = data.get('data_source_name') if data.get('data_source_name') is not None else data.get('from_data')
         from_data = ca.default_store.get_datasource_obj(ds_name, raw=True)
 
-        ca.custom_models.learn(name, from_data, to_predict, kwargs)
+        ca.custom_models.learn(name, from_data, to_predict, ca.default_store.get_datasource(ds_name)['id'], kwargs)
 
         return '', 200
 
-@ns_conf.route('/<name>/columns')
-@ns_conf.param('name', 'The predictor identifier')
-class PredictorColumns(Resource):
-    @ns_conf.doc('get_predictor_columns')
+
+@ns_conf.route('/<name>/update')
+@ns_conf.param('name', 'Update predictor')
+class PredictorPredict(Resource):
+    @ns_conf.doc('Update predictor')
     def get(self, name):
-        '''List of predictors colums'''
-        try:
-            if is_custom(name):
-                model = ca.custom_models.get_model_data(name)
-            else:
-                model = ca.mindsdb_native.get_model_data(name, native_view=True)
-        except Exception:
-            abort(404, 'Invalid predictor name')
-
-        columns = []
-        for array, is_target_array in [(model['data_analysis']['target_columns_metadata'], True),
-                                       (model['data_analysis']['input_columns_metadata'], False)]:
-            for col_data in array:
-                column = {
-                    'name': col_data['column_name'],
-                    'data_type': col_data['data_type'].lower(),
-                    'is_target_column': is_target_array
-                }
-                if column['data_type'] == 'categorical':
-                    column['distribution'] = col_data["data_distribution"]["data_histogram"]["x"]
-                columns.append(column)
-
-        return columns, 200
+        msg = ca.naitve_interface.update_model(name)
+        return {
+            'message': msg
+        }
 
 @ns_conf.route('/<name>/predict')
 @ns_conf.param('name', 'The predictor identifier')
@@ -234,29 +183,20 @@ class PredictorPredict(Resource):
     @ns_conf.doc('post_predictor_predict', params=predictor_query_params)
     def post(self, name):
         '''Queries predictor'''
-
         data = request.json
+        when = data.get('when', {})
+        format_flag = data.get('format_flag', 'explain')
+        kwargs = data.get('kwargs', {})
 
-        when = data.get('when') or {}
-        try:
-            format_flag = data.get('format_flag')
-        except:
-            format_flag = 'explain'
-
-        try:
-            kwargs = data.get('kwargs')
-        except:
-            kwargs = {}
-
-        if type(kwargs) != type({}):
-            kwargs = {}
+        if when is None:
+            return 'No data provided for the predictions', 500
 
         if is_custom(name):
             return ca.custom_models.predict(name, when_data=when, **kwargs)
         else:
-            results = ca.mindsdb_native.predict(name, when_data=when, **kwargs)
+            results = ca.naitve_interface.predict(name, format_flag, when_data=when, **kwargs)
 
-        return preparse_results(results, format_flag)
+        return results
 
 
 @ns_conf.route('/<name>/predict_datasource')
@@ -265,79 +205,22 @@ class PredictorPredictFromDataSource(Resource):
     @ns_conf.doc('post_predictor_predict', params=predictor_query_params)
     def post(self, name):
         data = request.json
+        format_flag = data.get('format_flag', 'explain')
+        kwargs = data.get('kwargs', {})
 
-        from_data = ca.default_store.get_datasource_obj(data.get('data_source_name'), raw=True)
+        use_raw = False
+        if is_custom(name):
+            use_raw = True
+
+        from_data = ca.default_store.get_datasource_obj(data.get('data_source_name'), raw=use_raw)
         if from_data is None:
             abort(400, 'No valid datasource given')
 
-        try:
-            format_flag = data.get('format_flag')
-        except:
-            format_flag = 'explain'
-
-        try:
-            kwargs = data.get('kwargs')
-        except:
-            kwargs = {}
-
-        if type(kwargs) != type({}):
-            kwargs = {}
-
         if is_custom(name):
             return ca.custom_models.predict(name, from_data=from_data, **kwargs)
-        else:
-            results = ca.mindsdb_native.predict(name, when_data=from_data, **kwargs)
 
-        return preparse_results(results, format_flag)
-
-
-@ns_conf.route('/upload')
-class PredictorUpload(Resource):
-    @ns_conf.doc('predictor_query', params=upload_predictor_params)
-    def post(self):
-        '''Upload existing predictor'''
-        predictor_file = request.files['file']
-        # @TODO: Figure out how to remove
-        fpath = os.path.join(ca.config_obj.paths['tmp'], 'new.zip')
-        with open(fpath, 'wb') as f:
-            f.write(predictor_file.read())
-
-        ca.mindsdb_native.load_model(fpath)
-        try:
-            os.remove(fpath)
-        except Exception:
-            pass
-
-        return '', 200
-
-
-@ns_conf.route('/<name>/download')
-@ns_conf.param('name', 'The predictor identifier')
-class PredictorDownload(Resource):
-    @ns_conf.doc('get_predictor_download')
-    def get(self, name):
-        '''Export predictor to file'''
-        ca.mindsdb_native.export_model(name)
-        fname = name + '.zip'
-        original_file = os.path.join(fname)
-        # @TODO: Figure out how to remove
-        fpath = os.path.join(ca.config_obj.paths['tmp'], fname)
-        shutil.move(original_file, fpath)
-
-        with open(fpath, 'rb') as f:
-            data = BytesIO(f.read())
-
-        try:
-            os.remove(fpath)
-        except Exception as e:
-            pass
-
-        return send_file(
-            data,
-            mimetype='application/zip',
-            attachment_filename=fname,
-            as_attachment=True
-        )
+        results = ca.naitve_interface.predict(name, format_flag, when_data=from_data, **kwargs)
+        return results
 
 @ns_conf.route('/<name>/rename')
 @ns_conf.param('name', 'The predictor identifier')
@@ -350,7 +233,7 @@ class PredictorDownload(Resource):
             if is_custom(name):
                 ca.custom_models.rename_model(name, new_name)
             else:
-                ca.mindsdb_native.rename_model(name, new_name)
+                ca.naitve_interface.rename_model(name, new_name)
         except Exception as e:
             return str(e), 400
 

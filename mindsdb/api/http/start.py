@@ -12,26 +12,35 @@ from mindsdb.api.http.namespaces.predictor import ns_conf as predictor_ns
 from mindsdb.api.http.namespaces.datasource import ns_conf as datasource_ns
 from mindsdb.api.http.namespaces.util import ns_conf as utils_ns
 from mindsdb.api.http.namespaces.config import ns_conf as conf_ns
+from mindsdb.api.http.namespaces.stream import ns_conf as stream_ns
 from mindsdb.api.http.initialize import initialize_flask, initialize_interfaces, initialize_static
 from mindsdb.utilities.config import Config
-from mindsdb.utilities.log import initialize_log
+from mindsdb.utilities.log import initialize_log, get_log
+from mindsdb.interfaces.storage.db import session
+from flask_compress import Compress
 
 
-def start(config, verbose=False):
-    config = Config(config)
+def start(verbose, no_studio):
+    config = Config()
     if verbose:
-        config['log']['level']['console'] = 'DEBUG'
+        config.set(['log', 'level', 'console'], 'DEBUG')
 
     initialize_log(config, 'http', wrap_print=True)
 
     # start static initialization in a separate thread
-    init_static_thread = threading.Thread(target=initialize_static, args=(config,))
-    init_static_thread.start()
+    init_static_thread = None
+    if not no_studio:
+        init_static_thread = threading.Thread(target=initialize_static, args=(config,))
+        init_static_thread.start()
 
-    app, api = initialize_flask(config)
-    initialize_interfaces(config, app)
+    app, api = initialize_flask(config, init_static_thread, no_studio)
+    Compress(app)
+    initialize_interfaces(app)
 
-    static_root = Path(config.paths['static'])
+    static_root = config.paths['static']
+    if os.path.isabs(static_root) is False:
+        static_root = os.path.join(os.getcwd(), static_root)
+    static_root = Path(static_root)
 
     @app.route('/', defaults={'path': ''}, methods=['GET'])
     @app.route('/<path:path>', methods=['GET'])
@@ -39,22 +48,28 @@ def start(config, verbose=False):
         if path.startswith('api/'):
             return {'message': 'wrong query'}, 400
         if static_root.joinpath(path).is_file():
-            return send_from_directory(config.paths['static'], path)
+            return send_from_directory(static_root, path)
         else:
-            return send_from_directory(config.paths['static'], 'index.html')
+            return send_from_directory(static_root, 'index.html')
 
     api.add_namespace(predictor_ns)
     api.add_namespace(datasource_ns)
     api.add_namespace(utils_ns)
     api.add_namespace(conf_ns)
+    api.add_namespace(stream_ns)
 
     @api.errorhandler(Exception)
     def handle_exception(e):
+        get_log('http').error(f'http exception: {e}')
         # pass through HTTP errors
         if isinstance(e, HTTPException):
             return {'message': str(e)}, e.code, e.get_response().headers
         name = getattr(type(e), '__name__') or 'Unknown error'
         return {'message': f'{name}: {str(e)}'}, 500
+
+    @app.teardown_appcontext
+    def remove_session(*args, **kwargs):
+        session.close()
 
     port = config['api']['http']['port']
     host = config['api']['http']['host']
@@ -62,9 +77,13 @@ def start(config, verbose=False):
     server = os.environ.get('MINDSDB_DEFAULT_SERVER', 'waitress')
 
     # waiting static initialization
-    init_static_thread.join()
+    if not no_studio:
+        init_static_thread.join()
     if server.lower() == 'waitress':
-        serve(app, port=port, host=host)
+        if host in ('', '0.0.0.0'):
+            serve(app, port=port, host='*')
+        else:
+            serve(app, port=port, host=host)
     elif server.lower() == 'flask':
         # that will 'disable access' log in console
         log = logging.getLogger('werkzeug')

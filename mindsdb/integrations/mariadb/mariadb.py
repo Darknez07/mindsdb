@@ -1,11 +1,42 @@
 import mysql.connector
 
-from mindsdb_native.libs.constants.mindsdb import DATA_SUBTYPES
+from mindsdb.utilities.subtypes import DATA_SUBTYPES
 from mindsdb.integrations.base import Integration
+from mindsdb.utilities.log import log
 
 
-class Mariadb(Integration):
-    def _to_mariadb_table(self, stats, predicted_cols):
+class MariadbConnectionChecker:
+    def __init__(self, **kwargs):
+        self.host = kwargs.get('host')
+        self.port = kwargs.get('port')
+        self.user = kwargs.get('user')
+        self.password = kwargs.get('password')
+
+    def check_connection(self):
+        try:
+            con = mysql.connector.connect(
+                host=self.host,
+                port=self.port,
+                user=self.user,
+                password=self.password
+            )
+            connected = con.is_connected()
+            con.close()
+        except Exception:
+            connected = False
+        return connected
+
+
+class Mariadb(Integration, MariadbConnectionChecker):
+    def __init__(self, config, name):
+        super().__init__(config, name)
+        db_info = self.config['integrations'][self.name]
+        self.user = db_info.get('user', 'default')
+        self.password = db_info.get('password', None)
+        self.host = db_info.get('host')
+        self.port = db_info.get('port')
+
+    def _to_mariadb_table(self, stats, predicted_cols, columns):
         subtype_map = {
             DATA_SUBTYPES.INT: 'int',
             DATA_SUBTYPES.FLOAT: 'double',
@@ -14,6 +45,7 @@ class Mariadb(Integration):
             DATA_SUBTYPES.TIMESTAMP: 'Datetime',
             DATA_SUBTYPES.SINGLE: 'VARCHAR(500)',
             DATA_SUBTYPES.MULTIPLE: 'VARCHAR(500)',
+            DATA_SUBTYPES.TAGS: 'VARCHAR(500)',
             DATA_SUBTYPES.IMAGE: 'VARCHAR(500)',
             DATA_SUBTYPES.VIDEO: 'VARCHAR(500)',
             DATA_SUBTYPES.AUDIO: 'VARCHAR(500)',
@@ -23,15 +55,15 @@ class Mariadb(Integration):
         }
 
         column_declaration = []
-        for name in stats['columns']:
+        for name in columns:
             try:
                 col_subtype = stats[name]['typing']['data_subtype']
                 new_type = subtype_map[col_subtype]
                 column_declaration.append(f' `{name}` {new_type} ')
                 if name in predicted_cols:
                     column_declaration.append(f' `{name}_original` {new_type} ')
-            except Exception:
-                print(f'Error: cant convert type {col_subtype} of column {name} to mariadb type')
+            except Exception as e:
+                log.error(f'Error: can not determine mariadb data type for column {name}: {e}')
 
         return column_declaration
 
@@ -87,7 +119,7 @@ class Mariadb(Integration):
                 select_data_query VARCHAR(500),
                 external_datasource VARCHAR(500),
                 training_options VARCHAR(500)
-            ) ENGINE=CONNECT TABLE_TYPE=MYSQL CONNECTION='{connect}';
+            ) ENGINE=CONNECT CHARSET=utf8 TABLE_TYPE=MYSQL CONNECTION='{connect}';
         """
         self._query(q)
 
@@ -96,21 +128,20 @@ class Mariadb(Integration):
         q = f"""
             CREATE TABLE IF NOT EXISTS {self.mindsdb_database}.commands (
                 command VARCHAR(500)
-            ) ENGINE=CONNECT TABLE_TYPE=MYSQL CONNECTION='{connect}';
+            ) ENGINE=CONNECT CHARSET=utf8 TABLE_TYPE=MYSQL CONNECTION='{connect}';
         """
         self._query(q)
 
     def register_predictors(self, model_data_arr):
         for model_meta in model_data_arr:
             name = model_meta['name']
-            stats = model_meta['data_analysis']
-            columns_sql = ','.join(self._to_mariadb_table(stats, model_meta['predict']))
+            columns_sql = ','.join(self._to_mariadb_table(model_meta['data_analysis_v2'], model_meta['predict'], model_meta['columns']))
             columns_sql += ',`when_data` varchar(500)'
             columns_sql += ',`select_data_query` varchar(500)'
             columns_sql += ',`external_datasource` varchar(500)'
             for col in model_meta['predict']:
                 columns_sql += f',`{col}_confidence` double'
-                if model_meta['data_analysis'][col]['typing']['data_type'] == 'Numeric':
+                if model_meta['data_analysis_v2'][col]['typing']['data_type'] == 'Numeric':
                     columns_sql += f',`{col}_min` double'
                     columns_sql += f',`{col}_max` double'
                 columns_sql += f',`{col}_explain` varchar(500)'
@@ -120,7 +151,7 @@ class Mariadb(Integration):
             q = f"""
                     CREATE TABLE {self.mindsdb_database}.{self._escape_table_name(name)}
                     ({columns_sql}
-                    ) ENGINE=CONNECT TABLE_TYPE=MYSQL CONNECTION='{connect}';
+                    ) ENGINE=CONNECT CHARSET=utf8 TABLE_TYPE=MYSQL CONNECTION='{connect}';
             """
             self._query(q)
 
@@ -129,17 +160,3 @@ class Mariadb(Integration):
             drop table if exists {self.mindsdb_database}.{self._escape_table_name(name)};
         """
         self._query(q)
-
-    def check_connection(self):
-        try:
-            con = mysql.connector.connect(
-                host=self.config['integrations'][self.name]['host'],
-                port=self.config['integrations'][self.name]['port'],
-                user=self.config['integrations'][self.name]['user'],
-                password=self.config['integrations'][self.name]['password']
-            )
-            connected = con.is_connected()
-            con.close()
-        except Exception:
-            connected = False
-        return connected

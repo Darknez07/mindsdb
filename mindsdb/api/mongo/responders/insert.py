@@ -1,4 +1,6 @@
+import os
 from mindsdb.api.mongo.classes import Responder
+from mindsdb.interfaces.storage.db import session, Datasource
 import mindsdb.api.mongo.functions as helpers
 
 
@@ -6,6 +8,7 @@ class Responce(Responder):
     when = {'insert': helpers.is_true}
 
     def result(self, query, request_env, mindsdb_env, session):
+        self.company_id = os.environ.get('MINDSDB_COMPANY_ID', None)
         try:
             res = self._result(query, request_env, mindsdb_env)
         except Exception as e:
@@ -32,7 +35,8 @@ class Responce(Responder):
             'predict',
             'select_data_query',
             'external_datasource',
-            'training_options'
+            'training_options',
+            'connection'
         ]
 
         models = mindsdb_env['mindsdb_native'].get_models()
@@ -68,13 +72,26 @@ class Responce(Responder):
             kwargs = doc.get('training_options', {})
 
             if is_select_data_query:
-                ds, ds_name = mindsdb_env['data_store'].save_datasource(
+                integrations = mindsdb_env['config']['integrations'].keys()
+                connection = doc.get('connection')
+                if connection is None:
+                    if 'default_mongodb' in integrations:
+                        connection = 'default_mongodb'
+                    else:
+                        for integration in integrations:
+                            if integration.startswith('mongodb_'):
+                                connection = integration
+                                break
+
+                if connection is None:
+                    raise Exception("Can't find connection for data source")
+
+                _, ds_name = mindsdb_env['data_store'].save_datasource(
                     name=doc['name'],
-                    source_type='default_mongodb',
-                    source=doc['select_data_query']
+                    source_type=connection,
+                    source=dict(doc['select_data_query'])
                 )
             elif is_external_datasource:
-                ds = mindsdb_env['data_store'].get_datasource_obj(doc['external_datasource'], raw=True)
                 ds_name = doc['external_datasource']
 
             predict = doc['predict']
@@ -88,7 +105,8 @@ class Responce(Responder):
                         mindsdb_env['data_store'].delete_datasource(ds_name)
                     raise Exception(f"Column '{col}' not exists")
 
-            mindsdb_env['mindsdb_native'].learn(doc['name'], ds, predict, kwargs)
+            datasource_record = session.query(Datasource).filter_by(company_id=self.company_id, name=ds_name).first()
+            mindsdb_env['mindsdb_native'].learn(doc['name'], mindsdb_env['data_store'].get_datasource_obj(ds_name, raw=True), predict, datasource_record.id, dict(kwargs))
 
         result = {
             "n": len(query['documents']),
